@@ -1,0 +1,29 @@
+# Build output
+/target
+
+# Secrets and local configuration (this repository is public)
+.env
+.env.*
+!.env.example
+config.toml
+!config.example.toml
+*.key
+*.pem
+secrets/
+
+# Local session data / logs
+*.log
+/sessions/
+/.mistan/
+
+# Local agent notes
+/AGENTS.md
+/CLAUDE.md
+/.agents/
+/.claude/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
