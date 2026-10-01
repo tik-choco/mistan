@@ -25,6 +25,7 @@ tool_mode = "native"
 # model = "qwen3:8b"
 # tool_mode = "native"
 
+# reasoning_effort = "medium"  # none | minimal | low | medium | high | xhigh (ignored on the mistl AI network)
 # temperature = 0.2
 # mistl_bin = "mistl"           # name on PATH or full path to mistl(.exe)
 # mistl_instance = "dev"        # passed as `mistl --instance <name>`

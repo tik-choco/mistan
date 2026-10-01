@@ -6,12 +6,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::app::{App, Entry, ToolStatus};
+use super::app::{App, Entry, Picker, PickerKind, SettingsForm, ToolStatus};
 use super::text::{str_width, wrap_text};
+use crate::config::Backend;
 use crate::types::ToolMode;
 
 const MAX_INPUT_ROWS: usize = 6;
 const COLLAPSED_LINES: usize = 6;
+const MAX_SUGGESTIONS: usize = 8;
 
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
@@ -188,9 +190,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_transcript(f, app, body);
     draw_input(f, app, input_area, &rows, cursor);
     draw_footer(f, app, footer);
+    if !app.modal_open() {
+        draw_suggestions(f, app, body);
+    }
     if app.current_approval().is_some() {
-        f.set_cursor_position((area.x, area.y));
         draw_modal(f, app, area);
+    } else if let Some(form) = &app.form {
+        draw_settings(f, form, area);
+        if let Some(picker) = &form.picker {
+            draw_picker(f, picker, area);
+        }
+    } else if let Some(picker) = &app.picker {
+        draw_picker(f, picker, area);
     }
 }
 
@@ -213,6 +224,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("{} ", app.base_url), dim()),
         Span::styled(format!("tools:{mode} "), dim()),
     ];
+    if let Some(effort) = &app.reasoning_effort {
+        spans.push(Span::styled(format!("effort:{effort} "), dim()));
+    }
+    if !app.mistl_found {
+        spans.push(Span::styled("mistl:none ", dim()));
+    }
     if app.auto_approve {
         spans.push(Span::styled(
             " auto-approve ",
@@ -287,13 +304,53 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: (us
         gutter,
     );
     f.render_widget(Paragraph::new(lines), text_area);
-    if app.current_approval().is_none() {
+    if !app.modal_open() {
         let cy = text_area.y + cursor.0.saturating_sub(off) as u16;
         let cx = text_area.x + cursor.1 as u16;
         if cx < text_area.x + text_area.width.max(1) && cy < text_area.y + text_area.height.max(1) {
             f.set_cursor_position((cx, cy));
         }
     }
+}
+
+/// Slash-command completion popup, anchored to the bottom of `area` (just
+/// above the input box).
+fn draw_suggestions(f: &mut Frame, app: &App, area: Rect) {
+    let list = app.suggestions();
+    if list.is_empty() || area.height < 3 || area.width < 10 {
+        return;
+    }
+    let rows = list
+        .len()
+        .min(MAX_SUGGESTIONS)
+        .min(area.height as usize - 2);
+    let sel = app.suggest_sel.min(list.len() - 1);
+    let top = (sel + 1).saturating_sub(rows);
+    let cmd_w = list.iter().map(|s| str_width(&s.text)).max().unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, s) in list.iter().enumerate().skip(top).take(rows) {
+        let pad = " ".repeat(cmd_w - str_width(&s.text) + 2);
+        let (cmd_style, desc_style) = if i == sel {
+            let st = Style::default().fg(Color::Black).bg(Color::Cyan);
+            (st.add_modifier(Modifier::BOLD), st)
+        } else {
+            (Style::default().fg(Color::Cyan), dim())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {}{pad}", s.text), cmd_style),
+            Span::styled(format!("{} ", s.desc), desc_style),
+        ]));
+    }
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 2).min(area.width);
+    let h = rows as u16 + 2;
+    let rect = Rect::new(area.x, area.y + area.height - h, w, h);
+    let mut block = Block::default().borders(Borders::ALL).border_style(dim());
+    if list.len() > rows {
+        block = block.title_bottom(format!(" {}/{} ", sel + 1, list.len()));
+    }
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -307,8 +364,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             " y yes  n no  a always (this session)",
             Style::default().fg(Color::Yellow),
         )
+    } else if app.fetching {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.spinner()),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("fetching models…"),
+            Span::styled("   Esc cancel", dim()),
+        ])
     } else if let Some((h, _)) = &app.hint {
         Line::styled(format!(" {h}"), Style::default().fg(Color::Yellow))
+    } else if !app.busy && !app.suggestions().is_empty() {
+        Line::styled(" ↑↓ select  Tab complete  Enter run  Esc hide", dim())
     } else if app.busy {
         Line::from(vec![
             Span::styled(
@@ -361,7 +429,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" Run this command? ");
+        .title(" Approval needed ");
     if queued > 0 {
         block = block.title_bottom(format!(" +{queued} more waiting "));
     }
@@ -380,4 +448,316 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
             .alignment(Alignment::Left),
         rect,
     );
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
+    let rect = centered(area, area.width.saturating_sub(4).clamp(20, 80), 18);
+    let title = match picker.kind {
+        PickerKind::Model => " Choose model ",
+        PickerKind::Effort => " Reasoning effort ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let [filter, list, count, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    f.render_widget(Paragraph::new(format!("Filter: {}", picker.filter)), filter);
+    let items = picker.filtered();
+    let height = list.height as usize;
+    let start = picker
+        .selected
+        .saturating_sub(height / 2)
+        .min(items.len().saturating_sub(height));
+    let lines: Vec<Line> = if items.is_empty() {
+        vec![Line::styled(
+            "No matches; Enter uses the typed text.",
+            dim(),
+        )]
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(height)
+            .map(|(i, item)| {
+                if i == picker.selected {
+                    Line::styled(
+                        format!("> {item}"),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    )
+                } else {
+                    Line::raw(format!("  {item}"))
+                }
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines), list);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                "{}/{} matches  ({}/{})",
+                items.len(),
+                picker.items.len(),
+                if items.is_empty() {
+                    0
+                } else {
+                    picker.selected + 1
+                },
+                items.len()
+            ),
+            dim(),
+        )),
+        count,
+    );
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            "Type filter  ↑↓/PgUp/PgDn move  Enter choose  Esc cancel",
+            dim(),
+        )),
+        footer,
+    );
+}
+
+fn masked_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let masked = chars.len().saturating_sub(4);
+    format!(
+        "{}{}",
+        "•".repeat(masked),
+        chars[masked..].iter().collect::<String>()
+    )
+}
+
+fn draw_settings(f: &mut Frame, form: &SettingsForm, area: Rect) {
+    let rect = centered(area, area.width.saturating_sub(4).clamp(20, 100), 17);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Settings ");
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let settings = &form.settings;
+    let backend = match settings.backend {
+        Backend::Mistl => "mistl AI network",
+        Backend::Custom => "OpenAI-compatible API",
+    };
+    let key = if form.api_key.is_empty() {
+        "(empty = keep stored key)".into()
+    } else {
+        masked_key(&form.api_key)
+    };
+    let mode = match settings.tool_mode {
+        ToolMode::Native => "native",
+        ToolMode::Prompt => "prompt",
+    };
+    let values = [
+        format!("Backend: {backend}"),
+        format!("Base URL: {}", settings.base_url),
+        format!("API key: {key}"),
+        format!("Model: {}", settings.model),
+        format!(
+            "Reasoning effort: {}",
+            settings.reasoning_effort.as_deref().unwrap_or("default")
+        ),
+        format!("Tool mode: {mode}"),
+    ];
+    let mut lines = Vec::new();
+    let mut selected_line = 0;
+    for (i, value) in values.into_iter().enumerate() {
+        if i == form.row {
+            selected_line = lines.len();
+        }
+        let ignored = i == 1 && settings.backend == Backend::Mistl;
+        let style = if ignored {
+            dim()
+        } else if i == form.row {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let prefix = if i == form.row { "> " } else { "  " };
+        for (j, line) in wrap_text(&value, inner.width.saturating_sub(2).max(1) as usize)
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(Line::styled(
+                format!("{}{line}", if j == 0 { prefix } else { "  " }),
+                style,
+            ));
+        }
+        if i == 4 && settings.backend == Backend::Mistl {
+            for line in wrap_text(
+                "(set by the provider on the AI network)",
+                inner.width.saturating_sub(2).max(1) as usize,
+            ) {
+                lines.push(Line::styled(format!("  {line}"), dim()));
+            }
+        }
+    }
+    if let Some(hint) = &form.hint {
+        lines.push(Line::styled(
+            hint.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    // Keep the selected row visible even in a small terminal or with a long URL.
+    let top = selected_line
+        .saturating_sub(body.height as usize / 2)
+        .min(lines.len().saturating_sub(body.height as usize));
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()),
+        body,
+    );
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            "Ctrl+S save  Esc cancel  ↑↓/Tab move  Enter change",
+            dim(),
+        )),
+        footer,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::tui::UiInfo;
+    use crate::types::AgentEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use tokio::sync::oneshot;
+
+    fn command(app: &mut App, text: &str) {
+        app.on_paste(text);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.take_effects();
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> (String, bool) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let frame = terminal.draw(|f| draw(f, app)).unwrap();
+        let text = frame
+            .buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        let input_cursor =
+            terminal.get_cursor_position().unwrap() != ratatui::layout::Position::ORIGIN;
+        (text, input_cursor)
+    }
+
+    #[test]
+    fn renders_command_suggestions() {
+        let mut app = App::new(&UiInfo::from_config(&Config::default()));
+        app.on_paste("/");
+        let (text, cursor) = render(&mut app, 100, 20);
+        assert!(text.contains("/help"));
+        assert!(text.contains("show keys and commands"));
+        assert!(
+            text.contains("1/18"),
+            "scroll position when the list overflows"
+        );
+        assert!(text.contains("Tab complete"));
+        assert!(cursor);
+        app.on_paste("set");
+        let (text, _) = render(&mut app, 100, 20);
+        assert!(text.contains("/settings"));
+        assert!(!text.contains("show keys and commands"));
+        // Tiny terminals skip the popup instead of panicking.
+        render(&mut app, 12, 6);
+    }
+
+    #[test]
+    fn renders_header_and_fetching_then_scrolled_picker_without_cursor() {
+        let cfg = Config {
+            reasoning_effort: Some("high".into()),
+            ..Config::default()
+        };
+        let mut info = UiInfo::from_config(&cfg);
+        info.mistl_found = false;
+        let mut app = App::new(&info);
+        let (text, cursor) = render(&mut app, 120, 30);
+        assert!(text.contains("effort:high"));
+        assert!(text.contains("mistl:none"));
+        assert!(cursor);
+        command(&mut app, "/model");
+        let (text, _) = render(&mut app, 120, 30);
+        assert!(text.contains("fetching models…"));
+        app.on_agent_event(AgentEvent::Models {
+            models: (0..100).map(|i| format!("model-{i:03}")).collect(),
+            error: None,
+        });
+        app.picker.as_mut().unwrap().selected = 70;
+        let (text, cursor) = render(&mut app, 120, 30);
+        assert!(text.contains("Choose model"));
+        assert!(text.contains("> model-070"));
+        assert!(text.contains("100/100"));
+        assert!(!text.contains("model-000"));
+        assert!(!cursor);
+    }
+
+    #[test]
+    fn renders_masked_settings_and_approval_priority_without_cursor() {
+        let mut app = App::new(&UiInfo::from_config(&Config::default()));
+        command(&mut app, "/settings");
+        app.form.as_mut().unwrap().row = 2;
+        app.on_paste("example-token");
+        let (text, cursor) = render(&mut app, 120, 30);
+        assert!(text.contains("API key: •••••••••oken"));
+        assert!(!text.contains("example-token"));
+        assert!(text.contains("(set by the provider on the AI network)"));
+        assert!(text.contains("Ctrl+S save  Esc cancel"));
+        assert!(!cursor);
+        let (reply, _receive) = oneshot::channel();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            title: "Download mistl?".into(),
+            reason: "".into(),
+            reply,
+        });
+        let (text, cursor) = render(&mut app, 120, 30);
+        assert!(text.contains("Approval needed"));
+        assert!(!text.contains(" Settings "));
+        assert!(!cursor);
+    }
+
+    #[test]
+    fn focused_settings_row_stays_visible_in_small_terminal() {
+        let mut app = App::new(&UiInfo::from_config(&Config::default()));
+        command(&mut app, "/settings");
+        app.form.as_mut().unwrap().settings.base_url = "x".repeat(200);
+        let (text, _) = render(&mut app, 36, 8);
+        assert!(text.contains("> Backend:"));
+        app.form.as_mut().unwrap().row = 5;
+        let (text, _) = render(&mut app, 36, 8);
+        assert!(text.contains("> Tool mode:"));
+        for (width, height) in [(1, 1), (8, 3), (20, 5)] {
+            render(&mut app, width, height);
+        }
+    }
 }

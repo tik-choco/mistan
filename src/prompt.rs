@@ -5,6 +5,16 @@ use serde_json::json;
 use crate::mistl::{TOOL_HELP, TOOL_MISTL, split_args};
 use crate::types::{FunctionCall, ToolCall, ToolMode, ToolOutput};
 
+/// System prompt when no mistl executable is available: plain chat, no tools.
+pub fn system_prompt_plain() -> String {
+    "You are mistan, a terminal assistant for the tik-choco ecosystem. The mistl CLI is not \
+installed on this machine, so you cannot run commands or inspect the user's mistl node. Answer \
+in the user's language, keep answers short, and never claim to have run anything. If the user \
+wants you to operate mistl, tell them to run `/mistl install` (or `mistan --install-mistl`) \
+and then start a new message.\n"
+        .into()
+}
+
 pub fn system_prompt(mode: ToolMode, catalog: &str) -> String {
     let mut s = String::from(
         "You are mistan, an assistant that operates the user's local mistl node by calling the \

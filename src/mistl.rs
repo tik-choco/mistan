@@ -354,6 +354,48 @@ impl MistlRunner {
         }
     }
 
+    pub fn bin(&self) -> &str {
+        &self.bin
+    }
+
+    pub fn set_bin(&mut self, bin: String) {
+        self.bin = bin;
+    }
+
+    /// Whether the configured mistl executable exists.
+    pub fn is_available(&self) -> bool {
+        crate::config::mistl_available(&self.bin)
+    }
+
+    /// Make sure the mistl daemon is running, starting it in the background if
+    /// not. Returns `true` when this call started it.
+    pub async fn ensure_daemon(&self, cancel: &CancellationToken) -> Result<bool> {
+        let status = self
+            .exec(
+                &["daemon".to_string(), "status".to_string()],
+                self.timeout,
+                cancel,
+            )
+            .await;
+        if status.ok {
+            return Ok(false);
+        }
+        // `daemon status` exits non-zero when it is down; starting it is
+        // idempotent enough (a racing start reports "already running").
+        let start = self
+            .exec(
+                &["daemon".to_string(), "start".to_string()],
+                self.timeout,
+                cancel,
+            )
+            .await;
+        if start.ok || start.text.contains("already running") {
+            Ok(start.ok)
+        } else {
+            bail!("mistl daemon start failed: {}", start.text)
+        }
+    }
+
     pub async fn run(&self, inv: &Invocation, cancel: &CancellationToken) -> ToolOutput {
         let args: Vec<String> = match inv {
             Invocation::Run(a) => a.clone(),
@@ -418,7 +460,8 @@ impl MistlRunner {
             Err(e) => {
                 return ToolOutput {
                     text: format!(
-                        "failed to start `{}`: {e}. Install mistl or point mistan at it with \
+                        "failed to start `{}`: {e}. Install mistl with `/mistl install` \
+                         (or `mistan --install-mistl`), or point mistan at it with \
                          `--mistl <path>`, `mistl_bin` in config.toml, or the MISTAN_MISTL \
                          environment variable.",
                         self.bin

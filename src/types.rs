@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::config::LlmSettings;
+
 /// One OpenAI chat message. Serialized as-is into `/v1/chat/completions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
@@ -157,6 +159,15 @@ pub enum AgentEvent {
     Info(String),
     /// The effective tool mode changed for this session.
     ToolModeChanged(ToolMode),
+    /// Result of a model-list request (`error` set on failure).
+    Models {
+        models: Vec<String>,
+        error: Option<String>,
+    },
+    /// LLM settings were applied (header refresh).
+    SettingsApplied(LlmSettings),
+    /// Whether the mistl executable can be found (startup, after install).
+    MistlAvailable(bool),
     Error(String),
     /// The whole user turn is over (success, error, or cancel).
     TurnDone,
@@ -177,4 +188,24 @@ pub enum UserCommand {
     /// Forget the conversation (keeps the system prompt).
     Clear,
     SetModel(String),
+    /// Session-only reasoning effort (`None` = do not send the field).
+    SetEffort(Option<String>),
+    /// Apply new LLM settings, start a fresh conversation, and save them to
+    /// the config file.
+    Configure(LlmSettings),
+    /// List the models of the current endpoint, or of `settings` when given
+    /// (used by the settings form before anything is saved).
+    ListModels(Option<LlmSettings>),
+    Mistl(MistlOp),
+}
+
+/// mistl management actions outside the model's tool loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MistlOp {
+    /// Report where mistl is and whether it is installed.
+    Info,
+    /// Start the daemon if it is not running.
+    Start,
+    /// Download and install the latest release (asks for approval).
+    Install,
 }

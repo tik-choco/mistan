@@ -2,6 +2,7 @@
 
 mod agent;
 mod config;
+mod install;
 mod llm;
 mod mistl;
 mod prompt;
@@ -35,6 +36,9 @@ struct Cli {
     /// Tool calling style: native (OpenAI tools) or prompt (fenced blocks)
     #[arg(long, value_parser = parse_tool_mode)]
     tool_mode: Option<ToolMode>,
+    /// Reasoning effort sent as `reasoning_effort` (low, medium, high, ...)
+    #[arg(long, env = "MISTAN_REASONING_EFFORT")]
+    reasoning_effort: Option<String>,
     /// mistl executable (name on PATH or full path)
     #[arg(long, env = "MISTAN_MISTL")]
     mistl: Option<String>,
@@ -48,6 +52,12 @@ struct Cli {
     /// State-changing commands are refused unless --yes is given.
     #[arg(long, short = 'p')]
     prompt: Option<String>,
+    /// Print the model ids of the configured endpoint and exit
+    #[arg(long)]
+    list_models: bool,
+    /// Download and install the latest mistl release, then exit
+    #[arg(long)]
+    install_mistl: bool,
 }
 
 fn parse_tool_mode(s: &str) -> Result<ToolMode, String> {
@@ -61,18 +71,25 @@ fn parse_tool_mode(s: &str) -> Result<ToolMode, String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.install_mistl {
+        return install_mistl().await;
+    }
     let cfg = config::load(
         cli.config.as_deref(),
         config::Overrides {
             base_url: cli.base_url,
             model: cli.model,
             tool_mode: cli.tool_mode,
+            reasoning_effort: cli.reasoning_effort,
             mistl_bin: cli.mistl,
             mistl_instance: cli.instance,
             auto_approve: cli.yes,
         },
     )?;
 
+    if cli.list_models {
+        return list_models(cfg).await;
+    }
     match cli.prompt {
         Some(prompt) => headless(cfg, prompt).await,
         None => {
@@ -81,6 +98,40 @@ async fn main() -> Result<()> {
             tui::run(info, handle).await
         }
     }
+}
+
+async fn install_mistl() -> Result<()> {
+    let dest = install::install_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine the install location"))?;
+    let release = install::latest_release().await?;
+    eprintln!(
+        "[info] downloading {} ({})",
+        release.asset_name, release.tag
+    );
+    let path = install::install_release(&release, &dest).await?;
+    println!("installed mistl {} at {}", release.tag, path.display());
+    Ok(())
+}
+
+async fn list_models(cfg: config::Config) -> Result<()> {
+    let mut handle = agent::spawn(cfg)?;
+    handle.commands.send(UserCommand::ListModels(None))?;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Models { models, error } => {
+                if let Some(e) = error {
+                    anyhow::bail!("{e}");
+                }
+                for m in models {
+                    println!("{m}");
+                }
+                return Ok(());
+            }
+            AgentEvent::Info(m) => eprintln!("[info] {m}"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("agent stopped before answering")
 }
 
 async fn headless(cfg: config::Config, prompt: String) -> Result<()> {
@@ -120,6 +171,9 @@ async fn headless(cfg: config::Config, prompt: String) -> Result<()> {
                 eprintln!("[error] {m}");
                 failed = true;
             }
+            AgentEvent::Models { .. }
+            | AgentEvent::SettingsApplied(_)
+            | AgentEvent::MistlAvailable(_) => {}
             AgentEvent::TurnDone => break,
         }
     }

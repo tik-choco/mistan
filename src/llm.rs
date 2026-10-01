@@ -48,6 +48,7 @@ pub struct LlmClient {
     model: String,
     api_key: Option<String>,
     temperature: Option<f32>,
+    reasoning_effort: Option<String>,
 }
 
 impl LlmClient {
@@ -66,6 +67,7 @@ impl LlmClient {
             model: cfg.model.clone(),
             api_key: cfg.api_key.clone(),
             temperature: cfg.temperature,
+            reasoning_effort: cfg.reasoning_effort.clone(),
         })
     }
 
@@ -75,6 +77,45 @@ impl LlmClient {
 
     pub fn set_model(&mut self, model: String) {
         self.model = model;
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
+    }
+
+    /// `GET <base_url>/models` -> sorted, de-duplicated model ids.
+    pub async fn list_models(&self, cancel: &CancellationToken) -> Result<Vec<String>> {
+        let base_url = self.base_url.as_deref().filter(|url| !url.is_empty()).ok_or_else(
+            || anyhow!("LLM base URL is not set; initialize the mistl AI network or configure a custom endpoint"),
+        )?;
+        let mut req = self
+            .http
+            .get(format!("{base_url}/models"))
+            .timeout(Duration::from_secs(20));
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = tokio::select! {
+            _ = cancel.cancelled() => bail!("cancelled"),
+            r = req.send() => r.map_err(|e| anyhow!("request failed: {}", e.without_url()))?,
+        };
+        let status = resp.status();
+        let bytes = tokio::select! {
+            _ = cancel.cancelled() => bail!("cancelled"),
+            b = resp.bytes() => b.map_err(|e| anyhow!("read failed: {}", e.without_url()))?,
+        };
+        if !status.is_success() {
+            return Err(http_error(
+                self.backend,
+                status.as_u16(),
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
+        }
+        let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+            anyhow!("unparsable model list ({e}): {snippet}")
+        })?;
+        Ok(parse_models(&v))
     }
 
     /// Stream one completion. `tools` empty -> no `tools` field sent.
@@ -98,6 +139,9 @@ impl LlmClient {
         }
         if let Some(t) = self.temperature {
             body["temperature"] = json!(t);
+        }
+        if let Some(e) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(e);
         }
 
         let mut req = self
@@ -156,6 +200,33 @@ impl LlmClient {
         }
         Ok(parser.finish(on_delta))
     }
+}
+
+/// Model ids out of an OpenAI `{"data":[{"id":..}]}` list (also accepts
+/// `{"models":[..]}` and plain string entries).
+fn parse_models(v: &Value) -> Vec<String> {
+    let items = v
+        .get("data")
+        .or_else(|| v.get("models"))
+        .or(Some(v))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter_map(|m| match m {
+            Value::String(s) => Some(s.as_str()),
+            _ => ["id", "name", "model"]
+                .iter()
+                .find_map(|k| m.get(*k).and_then(Value::as_str)),
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// Non-streaming `chat.completion` fallback.
@@ -307,6 +378,26 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_list_shapes() {
+        let openai = json!({"object":"list","data":[{"id":"b"},{"id":"a"},{"id":"b"},{"id":" "}]});
+        assert_eq!(parse_models(&openai), ["a", "b"]);
+        let alt = json!({"models":[{"name":"x"},"y",{"model":"z"},{"other":1}]});
+        assert_eq!(parse_models(&alt), ["x", "y", "z"]);
+        assert_eq!(parse_models(&json!(["m"])), ["m"]);
+        assert!(parse_models(&json!({"error":"nope"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_models_needs_base_url() {
+        let client = LlmClient::new(&Config::default()).unwrap();
+        let err = client
+            .list_models(&CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("LLM base URL is not set"));
+    }
 
     #[tokio::test]
     async fn missing_base_url() {

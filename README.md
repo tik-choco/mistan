@@ -18,8 +18,12 @@ CLI commands for you, then summarizes the results.
 ## Requirements
 
 - Rust (edition 2024)
-- A `mistl` binary on `PATH`, at the per-user install location (`mistl install`), or
-  given with `--mistl <path>`
+- `mistl` is optional. mistan finds it on `PATH`, at the per-user install location, or via
+  `--mistl <path>`. Without it mistan still works as a plain chat client for an
+  OpenAI-compatible API (no mistl tools). `/mistl install` (or `mistan --install-mistl`)
+  downloads the latest release from GitHub, verifies it against the release's
+  `SHA256SUMS.txt`, and installs it per user (the checksum list is not signature-checked).
+  When mistl is present but its daemon is down, mistan starts it automatically.
 
 ## Build
 
@@ -34,6 +38,8 @@ $ ./target/release/mistan
 $ mistan                                  # TUI, uses the mistl AI network
 $ mistan --base-url https://api.openai.com/v1 --model gpt-4.1-mini --tool-mode native
 $ mistan -p "Is the AI network up?"         # one-shot, no TUI (state changes refused unless --yes)
+$ mistan --list-models                      # print the endpoint's model ids
+$ mistan --install-mistl                    # download and install mistl
 ```
 
 mistan starts the local API automatically on the first turn and discovers its address
@@ -49,7 +55,24 @@ a node running `mistl ai provide start`. If none is reachable, check `mistl ai s
 | `Ctrl+O` | Expand/collapse tool output |
 | `Ctrl+C` | Cancel, or quit when idle |
 
-Commands: `/help`, `/clear`, `/model <id>`, `/quit`.
+Commands:
+
+Typing `/` opens a completion list of commands (and their arguments, such as effort levels
+and fetched model IDs). Use `Up`/`Down` to select, `Tab` to complete, `Enter` to run, and
+`Esc` to hide it.
+
+| Command | Action |
+| --- | --- |
+| `/model`, `/models` | Fetch the model list (`GET <base_url>/models`) and pick one; type to filter, Enter on unmatched text uses it as a custom id. `/model <id>` sets it directly |
+| `/effort [level]` | Pick or set `reasoning_effort` (`default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`) for this session |
+| `/settings` | Form for backend (mistl AI network / OpenAI-compatible API), base URL, API key, model, reasoning effort, tool mode. Ctrl+S saves to `config.toml` and starts a new conversation |
+| `/mistl [install\|start]` | Show where mistl is, install it, or start its daemon |
+| `/clear`, `/help`, `/quit` | As named |
+
+`reasoning_effort` is sent to OpenAI-compatible APIs. On the mistl AI network the provider
+chooses it, so the value is ignored there. `/settings` writes the API key in plain text to
+`config.toml` (owner-only on Unix); prefer `MISTAN_API_KEY`, which is never copied into the file.
+Saving rewrites `config.toml` without preserving comments.
 
 ## Configuration
 
@@ -77,6 +100,7 @@ supports tools; supply its key through `MISTAN_API_KEY`.
 | `MISTAN_API_KEY` (or `OPENAI_API_KEY`) | Bearer token for the chat endpoint |
 | `MISTAN_BASE_URL` | OpenAI-compatible base URL |
 | `MISTAN_MODEL` | Model id |
+| `MISTAN_REASONING_EFFORT` | `reasoning_effort` value |
 | `MISTAN_MISTL` | mistl executable |
 
 Use environment variables for API keys. Never commit them; `.gitignore` already

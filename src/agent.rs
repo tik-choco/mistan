@@ -7,12 +7,14 @@ use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Backend, Config};
+use crate::config::{self, Backend, Config, LlmSettings};
+use crate::install;
 use crate::llm::{LlmClient, is_tools_unsupported};
 use crate::mistl::{self, MistlRunner};
 use crate::prompt;
 use crate::types::{
-    AgentEvent, Approval, Message, Role, Safety, ToolCall, ToolMode, ToolOutput, UserCommand,
+    AgentEvent, Approval, Message, MistlOp, Role, Safety, ToolCall, ToolMode, ToolOutput,
+    UserCommand,
 };
 
 pub struct AgentHandle {
@@ -36,8 +38,17 @@ struct Agent {
     mode: ToolMode,
     catalog: String,
     auto_approve: bool,
+    /// The LLM endpoint is known (always true for a custom backend; for the
+    /// mistl backend it needs the daemon and `ai serve`).
+    endpoint_ready: bool,
+    /// mistl was found when the session started, so the mistl tools are on.
+    /// Without it mistan is a plain chat client.
+    mistl_ready: bool,
     tx: mpsc::UnboundedSender<AgentEvent>,
 }
+
+const NO_MISTL_HINT: &str = "mistl was not found. Run /mistl install (or `mistan --install-mistl`) \
+to download it, or point mistan at it with --mistl / mistl_bin.";
 
 /// Rewrite native tool history without retaining any tool-only wire fields.
 fn prompt_history(messages: &[Message]) -> Vec<Message> {
@@ -131,23 +142,42 @@ pub fn spawn(cfg: Config) -> Result<AgentHandle> {
         mode: cfg.tool_mode,
         catalog: String::new(),
         auto_approve: cfg.auto_approve,
+        endpoint_ready: false,
+        mistl_ready: false,
         tx: ev_tx,
         cfg,
     };
     let cancel_slot = cancel.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            // Every command gets a fresh token so Esc can interrupt slow ones.
+            let token = CancellationToken::new();
+            *cancel_slot.lock().unwrap() = token.clone();
             match cmd {
                 UserCommand::Send(text) => {
-                    let token = CancellationToken::new();
-                    *cancel_slot.lock().unwrap() = token.clone();
                     agent.turn(text, &token).await;
                     let _ = agent.tx.send(AgentEvent::TurnDone);
                 }
                 UserCommand::Clear => agent.messages.truncate(1),
                 UserCommand::SetModel(m) => {
+                    agent.cfg.model = m.clone();
                     agent.llm.set_model(m.clone());
-                    let _ = agent.tx.send(AgentEvent::Info(format!("model: {m}")));
+                    agent.send(AgentEvent::Info(format!("model: {m}")));
+                }
+                UserCommand::SetEffort(e) => {
+                    let e = config::normalize_effort(e);
+                    agent.cfg.reasoning_effort = e.clone();
+                    agent.llm.set_reasoning_effort(e.clone());
+                    agent.send(AgentEvent::Info(format!(
+                        "reasoning effort: {}",
+                        e.as_deref().unwrap_or("default")
+                    )));
+                }
+                UserCommand::Configure(s) => agent.configure(s),
+                UserCommand::ListModels(probe) => agent.list_models(probe, &token).await,
+                UserCommand::Mistl(op) => {
+                    agent.mistl_op(op, &token).await;
+                    agent.send(AgentEvent::TurnDone);
                 }
             }
         }
@@ -165,13 +195,224 @@ impl Agent {
         let _ = self.tx.send(ev);
     }
 
+    fn report(&self, e: anyhow::Error) {
+        if e.to_string() == "cancelled" {
+            self.send(AgentEvent::Info("cancelled".into()));
+        } else {
+            self.send(AgentEvent::Error(format!("{e:#}")));
+        }
+    }
+
+    fn system_prompt(&self) -> String {
+        if self.mistl_ready {
+            prompt::system_prompt(self.mode, &self.catalog)
+        } else {
+            prompt::system_prompt_plain()
+        }
+    }
+
+    /// Run `fut`, turning cancellation into the `"cancelled"` error.
+    async fn cancellable<T>(
+        token: &CancellationToken,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            _ = token.cancelled() => Err(anyhow::anyhow!("cancelled")),
+            r = fut => r,
+        }
+    }
+
+    /// Start the mistl daemon if it is down (best effort; reports a notice).
+    async fn start_daemon(&self, token: &CancellationToken) {
+        if !self.runner.is_available() {
+            return;
+        }
+        match Self::cancellable(token, self.runner.ensure_daemon(token)).await {
+            Ok(true) => self.send(AgentEvent::Info("started the mistl daemon".into())),
+            Ok(false) => {}
+            Err(e) if e.to_string() == "cancelled" => {}
+            Err(e) => self.send(AgentEvent::Info(format!("{e:#}"))),
+        }
+    }
+
+    /// Find the mistl local API: needs mistl, a running daemon, and `ai serve`.
+    async fn discover_mistl_api(&self, token: &CancellationToken) -> Result<String> {
+        if !self.runner.is_available() {
+            anyhow::bail!(
+                "the mistl AI network needs mistl, which was not found. Run /mistl install, or \
+                 open /settings and use an OpenAI-compatible API instead."
+            );
+        }
+        self.start_daemon(token).await;
+        let listen = Self::cancellable(token, self.runner.serve_start(token)).await?;
+        Ok(format!("http://{listen}/v1"))
+    }
+
+    async fn ensure_endpoint(&mut self, token: &CancellationToken) -> Result<()> {
+        if self.endpoint_ready {
+            return Ok(());
+        }
+        if self.cfg.backend == Backend::Mistl {
+            let url = self.discover_mistl_api(token).await?;
+            self.send(AgentEvent::Info(format!("AI network: via mistl ({url})")));
+            self.llm.set_base_url(url);
+        }
+        self.endpoint_ready = true;
+        Ok(())
+    }
+
+    /// Apply new LLM settings, save them, and start a fresh conversation.
+    fn configure(&mut self, s: LlmSettings) {
+        let mut cfg = self.cfg.clone();
+        if let Err(e) = s.apply(&mut cfg) {
+            self.send(AgentEvent::Error(format!("{e:#}")));
+            return;
+        }
+        let llm = match LlmClient::new(&cfg) {
+            Ok(l) => l,
+            Err(e) => {
+                self.send(AgentEvent::Error(format!("{e:#}")));
+                return;
+            }
+        };
+        let saved = match cfg.config_path.as_deref() {
+            Some(path) => match config::save_settings(path, &s) {
+                Ok(()) => format!("saved to {}", path.display()),
+                Err(e) => format!("not saved: {e:#}"),
+            },
+            None => "not saved: no config path".into(),
+        };
+        self.mode = cfg.tool_mode;
+        self.llm = llm;
+        self.cfg = cfg;
+        self.messages.clear();
+        self.endpoint_ready = false;
+        self.mistl_ready = false;
+        self.send(AgentEvent::SettingsApplied(LlmSettings::from_config(
+            &self.cfg,
+        )));
+        self.send(AgentEvent::Info(format!(
+            "settings applied; new conversation ({saved})"
+        )));
+    }
+
+    async fn list_models(&mut self, probe: Option<LlmSettings>, token: &CancellationToken) {
+        let result = async {
+            let settings = probe.unwrap_or_else(|| LlmSettings::from_config(&self.cfg));
+            let mut cfg = self.cfg.clone();
+            settings.apply(&mut cfg)?;
+            let mut client = LlmClient::new(&cfg)?;
+            if cfg.backend == Backend::Mistl {
+                client.set_base_url(self.discover_mistl_api(token).await?);
+            }
+            client.list_models(token).await
+        }
+        .await;
+        match result {
+            Ok(models) => self.send(AgentEvent::Models {
+                models,
+                error: None,
+            }),
+            Err(e) => self.send(AgentEvent::Models {
+                models: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+
+    async fn mistl_op(&mut self, op: MistlOp, token: &CancellationToken) {
+        match op {
+            MistlOp::Info => {
+                let found = self.runner.is_available();
+                self.send(AgentEvent::MistlAvailable(found));
+                self.send(AgentEvent::Info(if found {
+                    format!("mistl: {}", self.runner.bin())
+                } else {
+                    NO_MISTL_HINT.to_string()
+                }));
+            }
+            MistlOp::Start => {
+                if !self.runner.is_available() {
+                    self.send(AgentEvent::Error(NO_MISTL_HINT.into()));
+                    return;
+                }
+                match Self::cancellable(token, self.runner.ensure_daemon(token)).await {
+                    Ok(true) => self.send(AgentEvent::Info("started the mistl daemon".into())),
+                    Ok(false) => self.send(AgentEvent::Info(
+                        "the mistl daemon is already running".into(),
+                    )),
+                    Err(e) => self.report(e),
+                }
+            }
+            MistlOp::Install => {
+                if let Err(e) = self.install_mistl(token).await {
+                    self.report(e);
+                }
+            }
+        }
+    }
+
+    async fn install_mistl(&mut self, token: &CancellationToken) -> Result<()> {
+        let dest = install::install_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine the install location"))?;
+        self.send(AgentEvent::Info(
+            "looking up the latest mistl release…".into(),
+        ));
+        let release = Self::cancellable(token, install::latest_release()).await?;
+
+        let (reply, rx) = oneshot::channel();
+        self.send(AgentEvent::ApprovalRequest {
+            title: format!(
+                "Download mistl {} from github.com/tik-choco/mistl and install it to {}?",
+                release.tag,
+                dest.display()
+            ),
+            reason: "Downloads an executable and verifies it against the release's \
+                     SHA256SUMS.txt (the checksum list itself is not signature-checked)."
+                .into(),
+            reply,
+        });
+        let answer = tokio::select! {
+            _ = token.cancelled() => Approval::No,
+            a = rx => a.unwrap_or(Approval::No),
+        };
+        if answer == Approval::No {
+            self.send(AgentEvent::Info("install declined".into()));
+            return Ok(());
+        }
+        if answer == Approval::Always {
+            // The UI already shows auto-approve; keep both sides in agreement.
+            self.auto_approve = true;
+        }
+
+        self.send(AgentEvent::Info(format!(
+            "downloading {}…",
+            release.asset_name
+        )));
+        let path = Self::cancellable(token, install::install_release(&release, &dest)).await?;
+        let path = path.to_string_lossy().into_owned();
+        self.cfg.mistl_bin = path.clone();
+        self.runner.set_bin(path.clone());
+        if !self.mistl_ready {
+            // The running conversation was chat-only; the next one gets the tools.
+            self.messages.clear();
+            self.endpoint_ready = false;
+        }
+        self.send(AgentEvent::MistlAvailable(true));
+        self.send(AgentEvent::Info(format!(
+            "installed mistl {} at {path}. The daemon starts automatically with your next message.",
+            release.tag
+        )));
+        Ok(())
+    }
+
     fn fallback_to_prompt(&mut self, err: &anyhow::Error) -> bool {
         if self.mode != ToolMode::Native || !is_tools_unsupported(err) {
             return false;
         }
         self.mode = ToolMode::Prompt;
         self.messages = prompt_history(&self.messages);
-        self.messages[0] = Message::system(prompt::system_prompt(self.mode, &self.catalog));
+        self.messages[0] = Message::system(self.system_prompt());
         self.send(AgentEvent::Info(
             "the AI provider does not support tools; switched to prompt mode".into(),
         ));
@@ -181,43 +422,36 @@ impl Agent {
 
     async fn turn(&mut self, text: String, token: &CancellationToken) {
         if self.messages.is_empty() {
-            if self.cfg.backend == Backend::Mistl {
-                let started = tokio::select! {
+            if let Err(e) = self.ensure_endpoint(token).await {
+                self.report(e);
+                return;
+            }
+            self.mistl_ready = self.runner.is_available();
+            if self.mistl_ready {
+                if self.cfg.backend == Backend::Custom {
+                    self.start_daemon(token).await;
+                }
+                let catalog = tokio::select! {
                     _ = token.cancelled() => {
                         self.send(AgentEvent::Info("cancelled".into()));
                         return;
                     }
-                    r = self.runner.serve_start(token) => r,
+                    c = self.runner.catalog() => c,
                 };
-                match started {
-                    Ok(listen) => {
-                        self.llm.set_base_url(format!("http://{listen}/v1"));
-                        self.send(AgentEvent::Info(format!(
-                            "AI network: via mistl ({listen})"
-                        )));
-                    }
-                    Err(e) => {
-                        self.send(AgentEvent::Error(format!("{e:#}")));
-                        return;
-                    }
-                }
+                self.catalog = catalog;
+            } else {
+                self.send(AgentEvent::Info(format!(
+                    "{NO_MISTL_HINT} Chatting without mistl tools."
+                )));
             }
-            let catalog = tokio::select! {
-                _ = token.cancelled() => {
-                    self.send(AgentEvent::Info("cancelled".into()));
-                    return;
-                }
-                c = self.runner.catalog() => c,
-            };
-            self.catalog = catalog;
-            let sys = prompt::system_prompt(self.mode, &self.catalog);
+            let sys = self.system_prompt();
             self.messages.push(Message::system(sys));
         }
         self.messages.push(Message::user(text));
 
         for _ in 0..self.cfg.max_steps {
             let turn = loop {
-                let specs = if self.mode == ToolMode::Native {
+                let specs = if self.mistl_ready && self.mode == ToolMode::Native {
                     mistl::tool_specs()
                 } else {
                     Vec::new()
@@ -250,7 +484,10 @@ impl Agent {
             self.send(AgentEvent::AssistantDone);
 
             let native = self.mode == ToolMode::Native;
-            let calls: Vec<ToolCall> = if native {
+            let calls: Vec<ToolCall> = if !self.mistl_ready {
+                self.messages.push(Message::assistant(turn.content.clone()));
+                Vec::new()
+            } else if native {
                 self.messages.push(Message {
                     role: Role::Assistant,
                     content: (!turn.content.is_empty()).then(|| turn.content.clone()),
@@ -536,6 +773,8 @@ mod tests {
             catalog: "CATALOG".into(),
             messages: vec![Message::system("native"), Message::user("question")],
             auto_approve: false,
+            endpoint_ready: true,
+            mistl_ready: true,
             tx,
             cfg,
         };
@@ -578,6 +817,8 @@ mod tests {
             mode: cfg.tool_mode,
             catalog: String::new(),
             auto_approve: false,
+            endpoint_ready: false,
+            mistl_ready: false,
             tx,
             cfg,
         };
@@ -588,7 +829,7 @@ mod tests {
             assert!(agent.messages.is_empty());
             assert!(
                 matches!(events.try_recv().unwrap(), AgentEvent::Error(reason)
-                if reason.contains("mistl ai serve start failed"))
+                if reason.contains("needs mistl, which was not found"))
             );
             assert!(events.try_recv().is_err());
         }
