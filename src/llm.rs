@@ -47,8 +47,8 @@ pub struct LlmClient {
     backend: Backend,
     model: String,
     api_key: Option<String>,
-    temperature: Option<f32>,
     reasoning_effort: Option<String>,
+    unavailable: bool,
 }
 
 impl LlmClient {
@@ -66,8 +66,13 @@ impl LlmClient {
             backend: cfg.backend,
             model: cfg.model.clone(),
             api_key: cfg.api_key.clone(),
-            temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort.clone(),
+            unavailable: cfg.backend == Backend::Custom
+                && cfg.default_ref.as_ref().is_some_and(|r| {
+                    !cfg.providers
+                        .iter()
+                        .any(|p| p.id == r.provider_id && p.enabled)
+                }),
         })
     }
 
@@ -85,6 +90,9 @@ impl LlmClient {
 
     /// `GET <base_url>/models` -> sorted, de-duplicated model ids.
     pub async fn list_models(&self, cancel: &CancellationToken) -> Result<Vec<String>> {
+        if self.unavailable {
+            bail!("{}", crate::config::text::get("unavailable"));
+        }
         let base_url = self.base_url.as_deref().filter(|url| !url.is_empty()).ok_or_else(
             || anyhow!("LLM base URL is not set; initialize the mistl AI network or configure a custom endpoint"),
         )?;
@@ -128,6 +136,9 @@ impl LlmClient {
         on_delta: &mut (dyn FnMut(&str) + Send),
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
+        if self.unavailable {
+            bail!("{}", crate::config::text::get("unavailable"));
+        }
         let base_url = self.base_url.as_deref().filter(|url| !url.is_empty())
             .ok_or_else(|| anyhow!("LLM base URL is not set; initialize the mistl AI network or configure a custom endpoint"))?;
         let mut body = json!({ "messages": messages, "stream": true });
@@ -136,9 +147,6 @@ impl LlmClient {
         }
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
-        }
-        if let Some(t) = self.temperature {
-            body["temperature"] = json!(t);
         }
         if let Some(e) = &self.reasoning_effort {
             body["reasoning_effort"] = json!(e);
@@ -407,6 +415,94 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("LLM base URL is not set"));
+    }
+
+    #[tokio::test]
+    async fn disabled_default_is_not_replaced_or_fetched() {
+        let cfg = Config {
+            backend: Backend::Custom,
+            default_ref: Some(crate::config::ModelRef {
+                provider_id: "disabled".into(),
+                model: "raw".into(),
+            }),
+            providers: vec![crate::config::Provider {
+                id: "other".into(),
+                base_url: "https://example.invalid/v1".into(),
+                ..Default::default()
+            }],
+            ..Config::default()
+        };
+        let client = LlmClient::new(&cfg).unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            client.list_models(&cancel).await.unwrap_err().to_string(),
+            crate::config::text::get("unavailable")
+        );
+        assert_eq!(
+            client
+                .complete(&[], &[], &mut |_| {}, &cancel)
+                .await
+                .unwrap_err()
+                .to_string(),
+            crate::config::text::get("unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sends_raw_model_and_effort_without_temperature() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let body = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(start) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..start]).to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= start + 4 + length {
+                        break serde_json::from_slice::<Value>(
+                            &bytes[start + 4..start + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            let reply = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+            body
+        });
+        let cfg = Config {
+            backend: Backend::Custom,
+            base_url: Some(format!("http://{address}/v1")),
+            model: "raw-model".into(),
+            reasoning_effort: Some("high".into()),
+            ..Config::default()
+        };
+        let client = LlmClient::new(&cfg).unwrap();
+        client
+            .complete(
+                &[Message::user("hello")],
+                &[],
+                &mut |_| {},
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let body = server.await.unwrap();
+        assert_eq!(body["model"], "raw-model");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]

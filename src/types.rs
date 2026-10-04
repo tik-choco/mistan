@@ -143,6 +143,13 @@ pub enum AgentEvent {
         id: String,
         title: String,
     },
+    /// Live output of a running tool (stdout and stderr interleaved, ANSI
+    /// stripped, arbitrary chunk boundaries). Display only: the final text
+    /// handed to the model arrives in `ToolEnd`.
+    ToolOutput {
+        id: String,
+        chunk: String,
+    },
     /// A tool finished.
     ToolEnd {
         id: String,
@@ -192,11 +199,40 @@ pub enum UserCommand {
     SetEffort(Option<String>),
     /// Apply new LLM settings, start a fresh conversation, and save them to
     /// the config file.
-    Configure(LlmSettings),
+    Configure(Box<LlmSettings>),
     /// List the models of the current endpoint, or of `settings` when given
     /// (used by the settings form before anything is saved).
-    ListModels(Option<LlmSettings>),
+    ListModels(Option<Box<LlmSettings>>),
     Mistl(MistlOp),
+    /// `!<command>` typed by the user: run it in the workspace shell without
+    /// approval, stream it as a tool entry (ToolStart/ToolOutput/ToolEnd, then
+    /// TurnDone), and show the command and its output to the model with the
+    /// next `Send`.
+    Shell(String),
+}
+
+/// What the UI knows about the startup directory (header, `/just`, `!`
+/// completions). Built by `workspace::Workspace::summary`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkspaceSummary {
+    /// The startup directory (display form).
+    pub root: String,
+    /// The justfile in use (display form), when one was found.
+    pub justfile: Option<String>,
+    /// Public recipes in justfile order (modules flattened as `mod::recipe`).
+    pub recipes: Vec<RecipeInfo>,
+    /// Why recipes could not be listed (e.g. `just` missing); recipes is empty then.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecipeInfo {
+    /// Name as passed to `just`, e.g. `build` or `docs::serve`.
+    pub name: String,
+    /// Parameter signature in justfile syntax, e.g. `filter="" *args`.
+    pub params: String,
+    /// Doc comment, if any.
+    pub doc: Option<String>,
 }
 
 /// mistl management actions outside the model's tool loop.

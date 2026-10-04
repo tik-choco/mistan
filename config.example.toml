@@ -1,34 +1,33 @@
-# mistan configuration example.
-# Copy to %APPDATA%\mistan\config.toml (Windows) or ~/.config/mistan/config.toml
-# (Linux; ~/Library/Application Support/mistan/config.toml on macOS).
-# Prefer the MISTAN_API_KEY environment variable over writing api_key here.
+# mistan configuration example. See README for the per-user config directory.
+# Prefer MISTAN_API_KEY over storing an API key in a provider entry.
 
-# Default: mistl AI network (no key). mistan runs `mistl ai serve start`
-# automatically and discovers the selected instance's API address.
-# Needs a reachable provider, e.g. a node running `mistl ai provide start`.
-# backend = "mistl"   # explicit backend wins over any base_url
-model = ""            # empty = let the server choose
-# Native tools when the network provider advertises "tools" (mistl providers do).
-# Automatically falls back to prompt mode for providers without tool support.
+# Default: mistl AI network. Configure its providers, Room connections,
+# sharing, default_ref/tts/stt in mistl; they are not duplicated here.
+# mistan starts `mistl ai serve start` and discovers its address automatically.
+backend = "mistl"
+network_model = "" # raw model id; empty lets mistl choose
+# Native tools, with automatic fallback to prompt for unsupported tools.
 tool_mode = "native"
-# tool_mode = "prompt"  # forces prompt mode
+providers = []
 
-# Custom OpenAI-compatible provider with tool calling (key via MISTAN_API_KEY):
-# Setting base_url selects custom unless backend is explicit.
-# backend = "custom"  # requires base_url; replace an explicit "mistl" backend
-# base_url = "https://api.openai.com/v1"
-# model = "gpt-4.1-mini"
-# tool_mode = "native"
+# Custom HTTP connections: replace backend and providers above, then add
+# default_ref. The same model id at two providers is a different reference.
+# backend = "custom"
+# default_ref = { provider_id = "http-1", model = "model-id" }
+# [[providers]]
+# id = "http-1"
+# label = "My connection"
+# base_url = "https://example.invalid/v1"
+# api_key = "" # preferably supplied through MISTAN_API_KEY
+# enabled = true # omitted means true; disabled references are kept
+# models = ["model-id"] # optional cache; refreshed when the picker opens
 
-# Local Ollama:
-# base_url = "http://127.0.0.1:11434/v1"
-# model = "qwen3:8b"
-# tool_mode = "native"
-
-# reasoning_effort = "medium"  # none | minimal | low | medium | high | xhigh (ignored on the mistl AI network)
-# temperature = 0.2
-# mistl_bin = "mistl"           # name on PATH or full path to mistl(.exe)
-# mistl_instance = "dev"        # passed as `mistl --instance <name>`
+# Global options belong before any [[providers]] table.
+# reasoning_effort = "medium" # task/session setting; never temperature
+# mistl_bin = "mistl" # name on PATH or full path
+# mistl_instance = "dev" # passed as `mistl --instance <name>`
 # mistl_timeout_secs = 60
-# max_steps = 12                # model round-trips per message
-# auto_approve = false          # run state-changing mistl commands without asking
+# just_bin = "just" # name on PATH or full path
+# command_timeout_secs = 600 # foreground recipes / shell commands
+# max_steps = 12 # model round-trips per message
+# auto_approve = false # allow state-changing commands without asking

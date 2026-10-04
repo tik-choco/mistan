@@ -39,7 +39,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 name: TOOL_MISTL,
                 description: "Run the mistl CLI with these arguments (do not include the leading \
                     \"mistl\"), e.g. [\"store\",\"ls\"], [\"ai\",\"status\"], \
-                    [\"config\",\"set\",\"ai.default_preset_id\",\"default\"]. Many commands print \
+                    [\"config\",\"show\"]. Many commands print \
                     JSON. Read-only queries run immediately; state-changing commands require \
                     user approval and may be declined."
                     .into(),

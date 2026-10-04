@@ -6,6 +6,28 @@ pub fn str_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// Fit text into display cells, marking a truncated suffix with an ellipsis.
+pub fn truncate_text(s: &str, width: usize) -> String {
+    if str_width(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cells = ch.width().unwrap_or(0);
+        if used + cells > width - 1 {
+            break;
+        }
+        out.push(ch);
+        used += cells;
+    }
+    out.push('…');
+    out
+}
+
 /// Wrap `s` (which may contain `\n`) to lines of at most `width` columns.
 /// Prefers breaking at ASCII spaces; wide characters may break anywhere.
 /// Blank lines are preserved.
@@ -72,5 +94,17 @@ mod tests {
             vec!["hello", "world", "foo"]
         );
         assert_eq!(wrap_text("a\n\nb", 10), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn truncation_respects_display_cells_and_utf8() {
+        assert_eq!(truncate_text("hello", 5), "hello");
+        assert_eq!(truncate_text("hello", 4), "hel…");
+        assert_eq!(truncate_text("界界界", 4), "界…");
+        assert_eq!(truncate_text("界界界", 1), "…");
+        assert_eq!(truncate_text("hello", 0), "");
+        for width in 0..10 {
+            assert!(str_width(&truncate_text("hello界界界", width)) <= width);
+        }
     }
 }

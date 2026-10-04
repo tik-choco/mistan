@@ -7,12 +7,16 @@ use tokio::sync::oneshot;
 
 use super::UiInfo;
 use super::input::InputBuffer;
-use crate::config::{Backend, LlmSettings, default_tool_mode, normalize_effort};
-use crate::types::{AgentEvent, Approval, MistlOp, ToolMode, UserCommand};
+use super::text::truncate_text;
+use crate::config::{
+    Backend, LlmSettings, Provider, default_tool_mode, normalize_effort, text, unique_provider_id,
+};
+use crate::types::{AgentEvent, Approval, MistlOp, ToolMode, UserCommand, WorkspaceSummary};
 
 pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Ticks (~100ms each) a footer hint stays visible.
 const HINT_TICKS: u64 = 30;
+const MAX_LIVE_OUTPUT: usize = 64 * 1024;
 
 pub const EFFORTS: [&str; 7] = [
     "default", "none", "minimal", "low", "medium", "high", "xhigh",
@@ -20,9 +24,10 @@ pub const EFFORTS: [&str; 7] = [
 
 /// Slash commands offered as completions, in display order. Bare commands
 /// come before their argument forms so an exact match is selected first.
-const COMMANDS: [(&str, &str); 11] = [
+const COMMANDS: [(&str, &str); 12] = [
     ("/help", "show keys and commands"),
     ("/clear", "clear the conversation"),
+    ("/just", "list workspace recipes"),
     ("/model", "choose a model"),
     ("/models", "choose a model"),
     ("/effort", "choose reasoning effort"),
@@ -40,7 +45,7 @@ const COMMANDS: [(&str, &str); 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
     pub text: String,
-    pub desc: &'static str,
+    pub desc: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub struct Picker {
     pub filter: String,
     /// Index in the filtered list.
     pub selected: usize,
+    pub source: String,
 }
 
 impl Picker {
@@ -65,7 +71,21 @@ impl Picker {
             items,
             filter: String::new(),
             selected,
+            source: String::new(),
         }
+    }
+
+    fn for_models(items: Vec<String>, settings: &LlmSettings) -> Self {
+        let mut picker = Self::new(PickerKind::Model, items, &settings.model);
+        picker.source = if settings.backend == Backend::Mistl {
+            "mistl".into()
+        } else {
+            settings
+                .selected_provider()
+                .map(|p| p.label.clone())
+                .unwrap_or_else(|| text::get("unassigned").into())
+        };
+        picker
     }
 
     pub fn filtered(&self) -> Vec<&str> {
@@ -81,7 +101,10 @@ impl Picker {
         self.filtered()
             .get(self.selected)
             .map(|s| (*s).to_string())
-            .or_else(|| (!self.filter.trim().is_empty()).then(|| self.filter.trim().to_string()))
+            .or_else(|| {
+                (self.kind == PickerKind::Effort && !self.filter.trim().is_empty())
+                    .then(|| self.filter.trim().to_string())
+            })
     }
 
     fn edit(&mut self, text: &str) {
@@ -125,6 +148,7 @@ pub struct SettingsForm {
     pub row: usize,
     pub picker: Option<Picker>,
     pub hint: Option<String>,
+    delete_pending: bool,
 }
 
 impl SettingsForm {
@@ -135,6 +159,7 @@ impl SettingsForm {
             row: 0,
             picker: None,
             hint: None,
+            delete_pending: false,
         }
     }
 
@@ -151,6 +176,14 @@ impl SettingsForm {
             1 if self.settings.backend == Backend::Custom => Some(&mut self.settings.base_url),
             2 => Some(&mut self.api_key),
             3 => Some(&mut self.settings.model),
+            8 => {
+                let id = self.settings.default_ref.as_ref()?.provider_id.clone();
+                self.settings
+                    .providers
+                    .iter_mut()
+                    .find(|p| p.id == id)
+                    .map(|p| &mut p.label)
+            }
             _ => None,
         }
     }
@@ -165,10 +198,28 @@ impl SettingsForm {
     fn change(&mut self, backwards: bool) {
         match self.row {
             0 => {
+                if self.settings.backend == Backend::Custom {
+                    if let Ok(s) = self.value().canonical() {
+                        self.settings = s;
+                    }
+                } else {
+                    self.settings.network_model = self.settings.model.clone();
+                }
                 self.settings.backend = match self.settings.backend {
                     Backend::Mistl => Backend::Custom,
                     Backend::Custom => Backend::Mistl,
                 };
+                if self.settings.backend == Backend::Mistl {
+                    self.settings.model = self.settings.network_model.clone();
+                } else if let Some(id) = self
+                    .settings
+                    .default_ref
+                    .as_ref()
+                    .map(|r| r.provider_id.clone())
+                {
+                    self.settings.select_provider(&id);
+                }
+                self.api_key.clear();
                 self.settings.tool_mode = default_tool_mode(self.settings.backend);
             }
             4 => {
@@ -191,8 +242,83 @@ impl SettingsForm {
                     ToolMode::Prompt => ToolMode::Native,
                 }
             }
+            6 => {
+                if let Ok(s) = self.value().canonical() {
+                    self.settings = s;
+                }
+                let n = self.settings.providers.len();
+                if n == 0 {
+                    return;
+                }
+                let current = self
+                    .settings
+                    .selected_provider()
+                    .and_then(|p| {
+                        self.settings
+                            .providers
+                            .iter()
+                            .position(|other| other.id == p.id)
+                    })
+                    .unwrap_or(0);
+                let next = if backwards {
+                    (current + n - 1) % n
+                } else {
+                    (current + 1) % n
+                };
+                let id = self.settings.providers[next].id.clone();
+                self.settings.select_provider(&id);
+                self.api_key.clear();
+            }
+            7 => {
+                if let Some(id) = self
+                    .settings
+                    .default_ref
+                    .as_ref()
+                    .map(|r| r.provider_id.clone())
+                    && let Some(p) = self.settings.providers.iter_mut().find(|p| p.id == id)
+                {
+                    p.enabled = !p.enabled;
+                }
+            }
             _ => {}
         }
+    }
+
+    fn add_provider(&mut self) {
+        if let Ok(s) = self.value().canonical() {
+            self.settings = s;
+        }
+        let id = unique_provider_id(
+            &self.settings.providers,
+            self.settings
+                .default_ref
+                .as_ref()
+                .map(|r| r.provider_id.as_str()),
+        );
+        self.settings.providers.push(Provider {
+            id: id.clone(),
+            label: "HTTP".into(),
+            ..Provider::default()
+        });
+        self.settings.select_provider(&id);
+        self.settings.tool_mode = default_tool_mode(Backend::Custom);
+        self.api_key.clear();
+        self.row = 8;
+        self.delete_pending = false;
+    }
+
+    fn delete_provider(&mut self) {
+        if !self.delete_pending {
+            self.delete_pending = true;
+            self.hint = Some(text::get("delete_hint").into());
+            return;
+        }
+        if let Some(r) = &self.settings.default_ref {
+            self.settings.providers.retain(|p| p.id != r.provider_id);
+        }
+        self.api_key.clear();
+        self.delete_pending = false;
+        self.hint = Some(text::get("unavailable").into());
     }
 }
 
@@ -213,6 +339,7 @@ pub enum Entry {
         id: String,
         title: String,
         status: ToolStatus,
+        live_output: String,
     },
     Info(String),
     Error(String),
@@ -232,6 +359,7 @@ pub enum Effect {
 }
 
 pub struct App {
+    pub workspace: WorkspaceSummary,
     pub backend: Backend,
     pub reasoning_effort: Option<String>,
     pub mistl_found: bool,
@@ -264,7 +392,7 @@ pub struct App {
     history: Vec<String>,
     hist_idx: Option<usize>,
     draft: String,
-    /// Selected row of the slash-command completion popup.
+    /// Selected row of the command completion popup.
     pub suggest_sel: usize,
     /// Popup dismissed with Esc; cleared by the next edit.
     suggest_hidden: bool,
@@ -289,11 +417,13 @@ Keys:
 Commands:
   /help            this help
   /clear           clear conversation
+  /just            list workspace recipes and the justfile path
   /model [id]      choose or switch model (/models also opens the picker)
   /effort [level]  choose or set reasoning effort (default omits the field)
   /mistl [action]  show installation info; install or start mistl
   /settings        edit backend, API, model, effort and tool mode
   /quit, /exit     quit
+  !<command>       run a shell command in the workspace; its output is shared with the model on your next message
 Modal keys:
   Type/Up/Down/PgUp/PgDn  filter and navigate a picker; Enter chooses
   Up/Down/Tab     move between settings rows; Enter/Left/Right change
@@ -302,6 +432,7 @@ Modal keys:
 impl App {
     pub fn new(info: &UiInfo) -> Self {
         let mut app = Self {
+            workspace: info.workspace.clone(),
             backend: info.backend,
             reasoning_effort: info.reasoning_effort.clone(),
             mistl_found: info.mistl_found,
@@ -409,11 +540,20 @@ impl App {
                     id,
                     title,
                     status: ToolStatus::Running,
+                    live_output: String::new(),
                 });
             }
             AgentEvent::ToolEnd { id, ok, output } => {
                 let found = self.entries.iter_mut().rev().find_map(|e| match e {
-                    Entry::Tool { id: i, status, .. } if *i == id => Some(status),
+                    Entry::Tool {
+                        id: i,
+                        status,
+                        live_output,
+                        ..
+                    } if *i == id => {
+                        live_output.clear();
+                        Some(status)
+                    }
                     _ => None,
                 });
                 match found {
@@ -422,6 +562,7 @@ impl App {
                         title: id.clone(),
                         id,
                         status: ToolStatus::Done { ok, output },
+                        live_output: String::new(),
                     }),
                 }
             }
@@ -435,6 +576,26 @@ impl App {
                     reason,
                     reply: Some(reply),
                 });
+            }
+            AgentEvent::ToolOutput { id, chunk } => {
+                if let Some(output) = self.entries.iter_mut().rev().find_map(|e| match e {
+                    Entry::Tool {
+                        id: i,
+                        status: ToolStatus::Running,
+                        live_output,
+                        ..
+                    } if *i == id => Some(live_output),
+                    _ => None,
+                }) {
+                    output.push_str(&chunk);
+                    if output.len() > MAX_LIVE_OUTPUT {
+                        let mut start = output.len() - MAX_LIVE_OUTPUT;
+                        while !output.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        output.drain(..start);
+                    }
+                }
             }
             AgentEvent::Info(m) => self.entries.push(Entry::Info(m)),
             AgentEvent::ToolModeChanged(mode) => {
@@ -470,23 +631,46 @@ impl App {
                         self.entries.push(Entry::Error(message));
                     }
                 } else {
+                    let cached = models.clone();
+                    let settings = if target == Some(PickerTarget::Form) {
+                        self.form.as_mut().map(|f| &mut f.settings)
+                    } else {
+                        Some(&mut self.settings)
+                    };
+                    if let Some(s) = settings
+                        && s.backend == Backend::Custom
+                        && let Some(id) = s.default_ref.as_ref().map(|r| r.provider_id.clone())
+                        && let Some(p) = s.providers.iter_mut().find(|p| p.id == id)
+                    {
+                        p.models = cached;
+                    }
                     self.models = models;
                     match target {
                         Some(PickerTarget::Model) => {
-                            self.picker = Some(Picker::new(
-                                PickerKind::Model,
-                                self.models.clone(),
-                                &self.model,
-                            ));
+                            if let Some(picker) = &mut self.picker {
+                                picker.items = self.models.clone();
+                                picker.selected = picker
+                                    .selected
+                                    .min(picker.filtered().len().saturating_sub(1));
+                            } else {
+                                self.picker =
+                                    Some(Picker::for_models(self.models.clone(), &self.settings));
+                            }
                         }
                         Some(PickerTarget::Form) => {
                             if let Some(form) = &mut self.form {
                                 form.hint = None;
-                                form.picker = Some(Picker::new(
-                                    PickerKind::Model,
-                                    self.models.clone(),
-                                    &form.settings.model,
-                                ));
+                                if let Some(picker) = &mut form.picker {
+                                    picker.items = self.models.clone();
+                                    picker.selected = picker
+                                        .selected
+                                        .min(picker.filtered().len().saturating_sub(1));
+                                } else {
+                                    form.picker = Some(Picker::for_models(
+                                        self.models.clone(),
+                                        &form.settings,
+                                    ));
+                                }
                             }
                         }
                         None if startup => self.entries.push(Entry::Info(format!(
@@ -693,33 +877,49 @@ impl App {
         self.current_approval().is_some() || self.picker.is_some() || self.form.is_some()
     }
 
-    /// Slash-command completions for the current input; empty when the popup
+    /// Slash and shell recipe completions; empty when the popup
     /// should not be shown.
     pub fn suggestions(&self) -> Vec<Suggestion> {
         let text = self.input.text();
         if self.suggest_hidden
             || self.hist_idx.is_some()
             || self.input.is_multiline()
-            || !text.starts_with('/')
+            || !(text.starts_with('/') || text.starts_with('!'))
         {
             return Vec::new();
         }
         let mut all: Vec<Suggestion> = Vec::new();
-        for (cmd, desc) in COMMANDS {
-            all.push(Suggestion {
-                text: cmd.into(),
-                desc,
-            });
-            match cmd {
-                "/models" => all.extend(self.models.iter().map(|m| Suggestion {
-                    text: format!("/model {m}"),
-                    desc: "switch to this model",
-                })),
-                "/effort" => all.extend(EFFORTS.iter().map(|e| Suggestion {
-                    text: format!("/effort {e}"),
-                    desc: "set reasoning effort",
-                })),
-                _ => {}
+        if text.starts_with('!') {
+            all.extend(self.workspace.recipes.iter().map(|recipe| {
+                let mut desc = recipe.params.clone();
+                if let Some(doc) = &recipe.doc {
+                    if !desc.is_empty() && !doc.is_empty() {
+                        desc.push_str("  # ");
+                    }
+                    desc.push_str(doc);
+                }
+                Suggestion {
+                    text: format!("!just {}", recipe.name),
+                    desc: truncate_text(&desc.split_whitespace().collect::<Vec<_>>().join(" "), 80),
+                }
+            }));
+        } else {
+            for (cmd, desc) in COMMANDS {
+                all.push(Suggestion {
+                    text: cmd.into(),
+                    desc: desc.into(),
+                });
+                match cmd {
+                    "/models" => all.extend(self.models.iter().map(|m| Suggestion {
+                        text: format!("/model {m}"),
+                        desc: "switch to this model".into(),
+                    })),
+                    "/effort" => all.extend(EFFORTS.iter().map(|e| Suggestion {
+                        text: format!("/effort {e}"),
+                        desc: "set reasoning effort".into(),
+                    })),
+                    _ => {}
+                }
             }
         }
         let typed = text.to_lowercase();
@@ -728,10 +928,19 @@ impl App {
             .filter(|s| s.text.to_lowercase().starts_with(&typed))
             .collect();
         // A lone exact match has nothing left to suggest.
-        if found.len() == 1 && found[0].text == text {
+        if found.len() == 1 && found[0].text == text && !self.recipe_has_params(text) {
             return Vec::new();
         }
         found
+    }
+
+    fn recipe_has_params(&self, command: &str) -> bool {
+        command.strip_prefix("!just ").is_some_and(|name| {
+            self.workspace
+                .recipes
+                .iter()
+                .any(|recipe| recipe.name == name && !recipe.params.trim().is_empty())
+        })
     }
 
     /// Handle a key aimed at the completion popup. Returns false when the key
@@ -753,7 +962,7 @@ impl App {
                 let chosen = &list[sel].text;
                 // Completing an already complete command steps into its
                 // arguments, e.g. "/effort" -> "/effort ".
-                let next = if chosen == self.input.text() {
+                let next = if chosen == self.input.text() || self.recipe_has_params(chosen) {
                     format!("{chosen} ")
                 } else {
                     chosen.clone()
@@ -762,6 +971,17 @@ impl App {
                 self.suggest_sel = 0;
             }
             KeyCode::Enter => {
+                if list[sel].text.starts_with('!') {
+                    let chosen = &list[sel].text;
+                    if self.recipe_has_params(chosen) {
+                        self.input.set(&format!("{chosen} "));
+                    } else {
+                        self.input.set(chosen);
+                        self.submit();
+                    }
+                    self.suggest_sel = 0;
+                    return true;
+                }
                 if list[sel].text == self.input.text() {
                     return false;
                 }
@@ -792,13 +1012,39 @@ impl App {
         }
         self.fetching = true;
         self.pending_picker = target;
-        self.effects
-            .push(Effect::Command(UserCommand::ListModels(settings)));
+        let selected = settings.as_ref().unwrap_or(&self.settings);
+        let cached = selected
+            .selected_provider()
+            .filter(|p| selected.backend == Backend::Custom && p.enabled)
+            .map(|p| p.models.clone());
+        if let Some(cached) = cached.filter(|models| !models.is_empty()) {
+            match target {
+                Some(PickerTarget::Model) => {
+                    self.picker = Some(Picker::for_models(cached, &self.settings))
+                }
+                Some(PickerTarget::Form) => {
+                    if let Some(form) = &mut self.form {
+                        form.picker = Some(Picker::for_models(cached, &form.settings));
+                    }
+                }
+                None => {}
+            }
+        }
+        self.effects.push(Effect::Command(UserCommand::ListModels(
+            settings.map(Box::new),
+        )));
     }
 
     fn set_model(&mut self, model: String) {
         self.model = model.clone();
         self.settings.model = model.clone();
+        if self.settings.backend == Backend::Custom {
+            if let Some(r) = &mut self.settings.default_ref {
+                r.model = model.clone();
+            }
+        } else {
+            self.settings.network_model = model.clone();
+        }
         self.entries
             .push(Entry::Info(format!("Model set to {model}.")));
         self.effects
@@ -816,6 +1062,10 @@ impl App {
     fn on_picker_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
             self.picker = None;
+            if self.pending_picker == Some(PickerTarget::Model) {
+                self.pending_picker = None;
+                self.effects.push(Effect::CancelTurn);
+            }
         } else if key.code == KeyCode::Enter {
             if self.busy {
                 self.set_hint("Cannot change settings while a turn is running.");
@@ -824,6 +1074,10 @@ impl App {
             let choice = self.picker.as_ref().and_then(Picker::choice);
             if let Some(choice) = choice {
                 let picker = self.picker.take().unwrap();
+                if self.pending_picker == Some(PickerTarget::Model) {
+                    self.pending_picker = None;
+                    self.effects.push(Effect::CancelTurn);
+                }
                 match picker.kind {
                     PickerKind::Model => self.set_model(choice),
                     PickerKind::Effort => self.set_effort(&choice),
@@ -838,11 +1092,21 @@ impl App {
         let form = self.form.as_mut().unwrap();
         if let Some(picker) = &mut form.picker {
             match key.code {
-                KeyCode::Esc => form.picker = None,
+                KeyCode::Esc => {
+                    form.picker = None;
+                    if self.pending_picker == Some(PickerTarget::Form) {
+                        self.pending_picker = None;
+                        self.effects.push(Effect::CancelTurn);
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(choice) = picker.choice() {
                         form.settings.model = choice;
                         form.picker = None;
+                        if self.pending_picker == Some(PickerTarget::Form) {
+                            self.pending_picker = None;
+                            self.effects.push(Effect::CancelTurn);
+                        }
                     }
                 }
                 _ => picker.on_key(key),
@@ -850,7 +1114,12 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code != KeyCode::Char('d') || !ctrl {
+            form.delete_pending = false;
+        }
         match key.code {
+            KeyCode::Char('n') if ctrl => form.add_provider(),
+            KeyCode::Char('d') if ctrl => form.delete_provider(),
             KeyCode::Esc => {
                 self.form = None;
                 if self.pending_picker == Some(PickerTarget::Form) {
@@ -863,17 +1132,22 @@ impl App {
                     form.hint = Some("Cannot save settings while a turn is running.".into());
                 } else {
                     let settings = form.value();
+                    let mut validation = crate::config::Config::default();
+                    if let Err(error) = settings.apply(&mut validation) {
+                        form.hint = Some(error.to_string());
+                        return;
+                    }
                     if self.pending_picker == Some(PickerTarget::Form) {
                         self.pending_picker = None;
                         self.effects.push(Effect::CancelTurn);
                     }
                     self.effects
-                        .push(Effect::Command(UserCommand::Configure(settings)));
+                        .push(Effect::Command(UserCommand::Configure(Box::new(settings))));
                     self.form = None;
                 }
             }
-            KeyCode::Up | KeyCode::BackTab => form.row = (form.row + 5) % 6,
-            KeyCode::Down | KeyCode::Tab => form.row = (form.row + 1) % 6,
+            KeyCode::Up | KeyCode::BackTab => form.row = (form.row + 8) % 9,
+            KeyCode::Down | KeyCode::Tab => form.row = (form.row + 1) % 9,
             KeyCode::Enter if form.row == 3 => {
                 if self.busy {
                     form.hint = Some("Cannot list models while a turn is running.".into());
@@ -931,6 +1205,7 @@ impl App {
     }
 
     fn submit(&mut self) {
+        let shell_mode = self.input.text().starts_with('!');
         let text = self.input.text().trim().to_string();
         if text.is_empty() {
             return;
@@ -943,6 +1218,21 @@ impl App {
         }
         if self.busy || self.fetching {
             self.set_hint("A turn is running. Wait for it to finish, or press Esc to cancel.");
+            return;
+        }
+        if shell_mode {
+            let command = text[1..].trim();
+            if command.is_empty() {
+                self.set_hint("Usage: !<command>");
+                return;
+            }
+            let command = command.to_string();
+            self.input.clear();
+            self.remember(&text);
+            self.busy = true;
+            self.scroll_top = None;
+            self.effects
+                .push(Effect::Command(UserCommand::Shell(command)));
             return;
         }
         self.input.clear();
@@ -974,6 +1264,34 @@ impl App {
         }
         match name {
             "help" | "?" => self.entries.push(Entry::Info(HELP.into())),
+            "just" => {
+                let mut text = match &self.workspace.justfile {
+                    Some(path) => {
+                        let mut text = format!("Justfile: {path}");
+                        for recipe in &self.workspace.recipes {
+                            text.push('\n');
+                            text.push_str(&recipe.name);
+                            if !recipe.params.is_empty() {
+                                text.push(' ');
+                                text.push_str(&recipe.params);
+                            }
+                            if let Some(doc) = &recipe.doc
+                                && !doc.is_empty()
+                            {
+                                text.push_str("  # ");
+                                text.push_str(doc);
+                            }
+                        }
+                        text
+                    }
+                    None => format!("No justfile found in {}.", self.workspace.root),
+                };
+                if let Some(error) = &self.workspace.error {
+                    text.push_str(&format!("\nError: {error}"));
+                }
+                self.entries.push(Entry::Info(text));
+                self.scroll_top = None;
+            }
             "clear" => {
                 if self.busy {
                     self.set_hint("Cannot /clear while a turn is running (Esc to cancel).");
@@ -1130,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn models_open_requested_picker_and_custom_choice() {
+    fn models_open_requested_picker_without_manual_choice() {
         let mut app = App::new(&info());
         command(&mut app, "/model");
         app.take_effects();
@@ -1157,8 +1475,8 @@ mod tests {
         app.on_paste("custom-model");
         assert!(app.picker.as_ref().unwrap().filtered().is_empty());
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.model, "custom-model");
-        assert!(app.picker.is_none());
+        assert_eq!(app.model, "ALPINE");
+        assert!(app.picker.is_some());
         assert!(app.input.is_empty());
     }
 
@@ -1242,9 +1560,10 @@ mod tests {
             model: "model-id".into(),
             reasoning_effort: Some("xhigh".into()),
             tool_mode: ToolMode::Native,
+            ..LlmSettings::from_config(&crate::config::Config::default())
         };
         assert!(
-            matches!(app.take_effects().as_slice(), [Effect::Command(UserCommand::Configure(s))] if s == &expected)
+            matches!(app.take_effects().as_slice(), [Effect::Command(UserCommand::Configure(s))] if s.as_ref() == &expected)
         );
         assert!(app.form.is_none());
         assert_eq!(app.backend, Backend::Mistl); // Wait for SettingsApplied.
@@ -1275,7 +1594,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.fetching);
         assert!(
-            matches!(app.take_effects().as_slice(), [Effect::Command(UserCommand::ListModels(Some(s)))] if s == &app.settings)
+            matches!(app.take_effects().as_slice(), [Effect::Command(UserCommand::ListModels(Some(s)))] if s.as_ref() == &app.settings)
         );
         app.on_agent_event(AgentEvent::Models {
             models: vec!["chosen".into()],
@@ -1304,6 +1623,57 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.form.is_none());
         assert!(app.take_effects().is_empty());
+    }
+
+    #[test]
+    fn connection_form_keeps_identity_when_disabled_or_deleted() {
+        let mut s = LlmSettings::from_config(&crate::config::Config::default());
+        s.backend = Backend::Custom;
+        s.base_url = "https://example.invalid/v1".into();
+        s.model = "same-model".into();
+        s = s.canonical().unwrap();
+        let original = s.default_ref.clone();
+        let mut form = SettingsForm::new(s);
+        form.row = 7;
+        form.change(false);
+        assert!(!form.settings.selected_provider().unwrap().enabled);
+        assert_eq!(form.settings.default_ref, original);
+        form.delete_provider();
+        assert_eq!(form.settings.providers.len(), 1);
+        form.delete_provider();
+        assert!(form.settings.providers.is_empty());
+        assert_eq!(form.settings.default_ref, original);
+        form.add_provider();
+        assert_eq!(form.settings.providers.len(), 1);
+        assert!(form.settings.selected_provider().unwrap().enabled);
+        assert!(form.settings.model.is_empty());
+    }
+
+    #[test]
+    fn cached_picker_revalidation_keeps_filter_and_does_not_reopen_after_cancel() {
+        let mut app = App::new(&info());
+        let mut s = app.settings.clone();
+        s.backend = Backend::Custom;
+        s.base_url = "https://example.invalid/v1".into();
+        s = s.canonical().unwrap();
+        s.providers[0].models = vec!["alpha".into()];
+        app.on_agent_event(AgentEvent::SettingsApplied(s));
+        command(&mut app, "/model");
+        assert!(app.picker.is_some());
+        app.on_paste("alp");
+        app.on_agent_event(AgentEvent::Models {
+            models: vec!["alpha".into(), "beta".into()],
+            error: None,
+        });
+        assert_eq!(app.picker.as_ref().unwrap().filter, "alp");
+        press(&mut app, KeyCode::Esc);
+        command(&mut app, "/model");
+        press(&mut app, KeyCode::Esc);
+        app.on_agent_event(AgentEvent::Models {
+            models: vec!["alpha".into()],
+            error: None,
+        });
+        assert!(app.picker.is_none());
     }
 
     #[test]
@@ -1405,7 +1775,7 @@ mod tests {
         save(&mut app);
         assert!(app.form.is_none());
         assert!(
-            matches!(app.take_effects().as_slice(), [Effect::CancelTurn, Effect::Command(UserCommand::Configure(s))] if s == &app.settings)
+            matches!(app.take_effects().as_slice(), [Effect::CancelTurn, Effect::Command(UserCommand::Configure(s))] if s.as_ref() == &app.settings)
         );
         app.on_agent_event(AgentEvent::Models {
             models: vec!["late".into()],
@@ -1566,6 +1936,223 @@ mod tests {
 
     fn texts(a: &App) -> Vec<String> {
         a.suggestions().into_iter().map(|s| s.text).collect()
+    }
+
+    fn workspace_info() -> UiInfo {
+        let mut info = info();
+        info.workspace = WorkspaceSummary {
+            root: "project".into(),
+            justfile: Some("project/justfile".into()),
+            recipes: vec![
+                crate::types::RecipeInfo {
+                    name: "build".into(),
+                    params: String::new(),
+                    doc: Some("Build the application".into()),
+                },
+                crate::types::RecipeInfo {
+                    name: "test".into(),
+                    params: "filter=\"\" *args".into(),
+                    doc: Some("Run tests".into()),
+                },
+            ],
+            error: None,
+        };
+        info
+    }
+
+    #[test]
+    fn shell_submit_records_history_without_user_entry() {
+        let mut app = App::new(&workspace_info());
+        let entries = app.entries.clone();
+        app.scroll_top = Some(0);
+        command(&mut app, "!  echo hello  ");
+        assert!(matches!(app.take_effects().as_slice(),
+            [Effect::Command(UserCommand::Shell(cmd))] if cmd == "echo hello"));
+        assert!(app.busy);
+        assert!(app.input.is_empty());
+        assert_eq!(app.scroll_top, None);
+        assert_eq!(app.entries, entries);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.text(), "!  echo hello");
+        app.on_agent_event(AgentEvent::ToolStart {
+            id: "shell".into(),
+            title: "! echo hello".into(),
+        });
+        assert_eq!(app.busy_label(), "running ! echo hello");
+        app.on_agent_event(AgentEvent::TurnDone);
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn shell_empty_and_busy_or_fetching_keep_input_and_show_hint() {
+        let mut app = App::new(&info());
+        for input in ["!", "!   "] {
+            app.input.set(input);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.hint.as_ref().unwrap().0, "Usage: !<command>");
+            assert_eq!(app.input.text(), input);
+            assert!(!app.busy);
+            assert!(app.take_effects().is_empty());
+            assert!(app.history.is_empty());
+        }
+        for (busy, fetching) in [(true, false), (false, true)] {
+            app.busy = busy;
+            app.fetching = fetching;
+            for input in ["!echo hello", "!"] {
+                app.input.set(input);
+                press(&mut app, KeyCode::Enter);
+                assert!(
+                    app.hint
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .starts_with("A turn is running.")
+                );
+                assert_eq!(app.input.text(), input);
+                assert!(app.take_effects().is_empty());
+                assert!(app.history.is_empty());
+            }
+        }
+        app.fetching = false;
+        app.input.set(" !echo hello");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.take_effects().as_slice(),
+            [Effect::Command(UserCommand::Send(text))] if text == "!echo hello"));
+    }
+
+    #[test]
+    fn shell_recipe_suggestions_filter_complete_and_run() {
+        let mut app = App::new(&workspace_info());
+        app.input.set("!");
+        assert_eq!(texts(&app), ["!just build", "!just test"]);
+        assert_eq!(app.suggestions()[1].desc, "filter=\"\" *args # Run tests");
+        app.input.set("!JUST B");
+        assert_eq!(texts(&app), ["!just build"]);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input.text(), "!just build");
+        assert!(app.take_effects().is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.take_effects().as_slice(),
+            [Effect::Command(UserCommand::Shell(cmd))] if cmd == "just build"));
+        app.on_agent_event(AgentEvent::TurnDone);
+        app.input.set("!just b");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.take_effects().as_slice(),
+            [Effect::Command(UserCommand::Shell(cmd))] if cmd == "just build"));
+        app.on_agent_event(AgentEvent::TurnDone);
+        for input in ["!just t", "!just test"] {
+            app.input.set(input);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.input.text(), "!just test ");
+            assert!(!app.busy);
+            assert!(app.take_effects().is_empty());
+        }
+        app.input.set("!just t");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input.text(), "!just test ");
+        app.on_paste("pattern");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.take_effects().as_slice(),
+            [Effect::Command(UserCommand::Shell(cmd))] if cmd == "just test pattern"));
+    }
+
+    #[test]
+    fn shell_recipe_descriptions_are_bounded_and_popup_can_hide() {
+        let mut info = workspace_info();
+        info.workspace.recipes[0].doc = Some("long description ".repeat(50));
+        let mut app = App::new(&info);
+        app.input.set("!");
+        assert!(super::super::text::str_width(&app.suggestions()[0].desc) <= 80);
+        assert!(app.suggestions()[0].desc.ends_with('…'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.suggestions().is_empty());
+        press(&mut app, KeyCode::Char('j'));
+        assert!(!app.suggestions().is_empty());
+        app.input.set("!echo");
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn live_tool_output_appends_by_id_caps_utf8_and_ignores_finished_or_unknown() {
+        let mut app = App::new(&info());
+        for id in ["one", "two"] {
+            app.on_agent_event(AgentEvent::ToolStart {
+                id: id.into(),
+                title: id.into(),
+            });
+        }
+        for chunk in ["hello ", "world\n"] {
+            app.on_agent_event(AgentEvent::ToolOutput {
+                id: "one".into(),
+                chunk: chunk.into(),
+            });
+        }
+        assert!(matches!(&app.entries[app.entries.len() - 2],
+            Entry::Tool { live_output, .. } if live_output == "hello world\n"));
+        assert!(matches!(app.entries.last().unwrap(),
+            Entry::Tool { live_output, .. } if live_output.is_empty()));
+        let before = app.entries.clone();
+        app.on_agent_event(AgentEvent::ToolOutput {
+            id: "unknown".into(),
+            chunk: "ignored".into(),
+        });
+        assert_eq!(app.entries, before);
+        let chunk = format!("{}END", "界".repeat(MAX_LIVE_OUTPUT));
+        app.on_agent_event(AgentEvent::ToolOutput {
+            id: "one".into(),
+            chunk: chunk.clone(),
+        });
+        let Entry::Tool { live_output, .. } = &app.entries[app.entries.len() - 2] else {
+            panic!()
+        };
+        assert!(live_output.len() <= MAX_LIVE_OUTPUT);
+        assert!(live_output.len() >= MAX_LIVE_OUTPUT - 3);
+        assert!(chunk.ends_with(live_output.as_str()));
+        app.on_agent_event(AgentEvent::ToolEnd {
+            id: "one".into(),
+            ok: true,
+            output: "final".into(),
+        });
+        let before = app.entries.clone();
+        app.on_agent_event(AgentEvent::ToolOutput {
+            id: "one".into(),
+            chunk: "late".into(),
+        });
+        assert_eq!(app.entries, before);
+        assert!(matches!(&app.entries[app.entries.len() - 2],
+            Entry::Tool { status: ToolStatus::Done { output, .. }, live_output, .. }
+                if output == "final" && live_output.is_empty()));
+    }
+
+    #[test]
+    fn just_info_lists_recipes_and_errors_even_while_busy() {
+        let mut app = App::new(&workspace_info());
+        app.busy = true;
+        command(&mut app, "/just");
+        assert_eq!(app.entries.last(), Some(&Entry::Info(
+            "Justfile: project/justfile\nbuild  # Build the application\ntest filter=\"\" *args  # Run tests".into())));
+        assert!(app.busy);
+        assert!(app.take_effects().is_empty());
+        app.workspace.error = Some("just unavailable".into());
+        command(&mut app, "/just");
+        assert!(
+            matches!(app.entries.last(), Some(Entry::Info(text)) if text.ends_with("Error: just unavailable"))
+        );
+        app.workspace.justfile = None;
+        app.workspace.recipes.clear();
+        command(&mut app, "/just");
+        assert_eq!(
+            app.entries.last(),
+            Some(&Entry::Info(
+                "No justfile found in project.\nError: just unavailable".into()
+            ))
+        );
+        app.workspace.error = None;
+        command(&mut app, "/just");
+        assert_eq!(
+            app.entries.last(),
+            Some(&Entry::Info("No justfile found in project.".into()))
+        );
     }
 
     #[test]

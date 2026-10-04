@@ -7,12 +7,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::app::{App, Entry, Picker, PickerKind, SettingsForm, ToolStatus};
-use super::text::{str_width, wrap_text};
+use super::text::{str_width, truncate_text, wrap_text};
 use crate::config::Backend;
 use crate::types::ToolMode;
 
 const MAX_INPUT_ROWS: usize = 6;
 const COLLAPSED_LINES: usize = 6;
+const LIVE_LINES: usize = 8;
 const MAX_SUGGESTIONS: usize = 8;
 
 fn dim() -> Style {
@@ -123,7 +124,12 @@ pub fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
                 2,
                 Style::default().fg(Color::Red),
             ),
-            Entry::Tool { title, status, .. } => {
+            Entry::Tool {
+                title,
+                status,
+                live_output,
+                ..
+            } => {
                 let (mark, color) = match status {
                     ToolStatus::Running => (app.spinner().to_string(), Color::Yellow),
                     ToolStatus::Done { ok: true, .. } => ("✓".to_string(), Color::Green),
@@ -142,6 +148,22 @@ pub fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
                     2,
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 );
+                if matches!(status, ToolStatus::Running) && !live_output.is_empty() {
+                    let all: Vec<&str> = live_output.lines().collect();
+                    let start = if app.expand_tools {
+                        0
+                    } else {
+                        all.len().saturating_sub(LIVE_LINES)
+                    };
+                    for line in &all[start..] {
+                        for wrapped in wrap_text(line, width.saturating_sub(2).max(1)) {
+                            out.push(Line::from(vec![
+                                Span::raw("  "),
+                                Span::styled(wrapped, dim()),
+                            ]));
+                        }
+                    }
+                }
                 if let ToolStatus::Done { output, .. } = status {
                     let trimmed = output.trim_end();
                     if trimmed.is_empty() {
@@ -215,15 +237,38 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ToolMode::Native => "native",
         ToolMode::Prompt => "prompt",
     };
-    let mut spans = vec![
-        Span::styled(
-            " mistan ",
-            Style::default().fg(Color::Black).bg(Color::Cyan),
-        ),
+    let mut spans = vec![Span::styled(
+        " mistan ",
+        Style::default().fg(Color::Black).bg(Color::Cyan),
+    )];
+    let workspace = app
+        .workspace
+        .root
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    if !workspace.is_empty() {
+        // Leave room for the recipe status even with a long directory name.
+        let name_width = (area.width as usize).saturating_sub(28).max(4);
+        spans.push(Span::raw(format!(
+            " {} ",
+            truncate_text(workspace, name_width)
+        )));
+    }
+    if app.workspace.justfile.is_some() {
+        let status = if app.workspace.error.is_some() {
+            "just: error ".into()
+        } else {
+            format!("just: {} recipes ", app.workspace.recipes.len())
+        };
+        spans.push(Span::styled(status, dim()));
+    }
+    spans.extend([
         Span::raw(format!(" {model} ")),
         Span::styled(format!("{} ", app.base_url), dim()),
         Span::styled(format!("tools:{mode} "), dim()),
-    ];
+    ]);
     if let Some(effort) = &app.reasoning_effort {
         spans.push(Span::styled(format!("effort:{effort} "), dim()));
     }
@@ -236,7 +281,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Yellow),
         ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let mut remaining = area.width as usize;
+    let mut fitted = Vec::new();
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let text = truncate_text(&span.content, remaining);
+        remaining = remaining.saturating_sub(str_width(&text));
+        fitted.push(Span::styled(text, span.style));
+    }
+    f.render_widget(Paragraph::new(Line::from(fitted)), area);
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
@@ -268,12 +323,23 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: (usize, usize)) {
-    let border = if app.busy {
+    let shell_mode = app.input.text().starts_with('!');
+    let input_color = if shell_mode {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let border = if shell_mode {
+        Style::default().fg(input_color)
+    } else if app.busy {
         dim()
     } else {
         Style::default().fg(Color::Cyan)
     };
-    let block = Block::default().borders(Borders::ALL).border_style(border);
+    let mut block = Block::default().borders(Borders::ALL).border_style(border);
+    if shell_mode {
+        block = block.title(Span::styled(" ! shell ", border));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     let h = inner.height as usize;
@@ -296,9 +362,9 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: (us
     );
     f.render_widget(
         Paragraph::new(Line::styled(
-            "> ",
+            if shell_mode { "! " } else { "> " },
             Style::default()
-                .fg(Color::Cyan)
+                .fg(input_color)
                 .add_modifier(Modifier::BOLD),
         )),
         gutter,
@@ -313,7 +379,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: (us
     }
 }
 
-/// Slash-command completion popup, anchored to the bottom of `area` (just
+/// Command completion popup, anchored to the bottom of `area` (just
 /// above the input box).
 fn draw_suggestions(f: &mut Frame, app: &App, area: Rect) {
     let list = app.suggestions();
@@ -326,10 +392,17 @@ fn draw_suggestions(f: &mut Frame, app: &App, area: Rect) {
         .min(area.height as usize - 2);
     let sel = app.suggest_sel.min(list.len() - 1);
     let top = (sel + 1).saturating_sub(rows);
-    let cmd_w = list.iter().map(|s| str_width(&s.text)).max().unwrap_or(0);
+    let cmd_w = list
+        .iter()
+        .map(|s| str_width(&s.text))
+        .max()
+        .unwrap_or(0)
+        .min(area.width.saturating_sub(6) as usize);
+    let desc_w = (area.width as usize).saturating_sub(cmd_w + 6);
     let mut lines: Vec<Line> = Vec::new();
     for (i, s) in list.iter().enumerate().skip(top).take(rows) {
-        let pad = " ".repeat(cmd_w - str_width(&s.text) + 2);
+        let command = truncate_text(&s.text, cmd_w);
+        let pad = " ".repeat(cmd_w - str_width(&command) + 2);
         let (cmd_style, desc_style) = if i == sel {
             let st = Style::default().fg(Color::Black).bg(Color::Cyan);
             (st.add_modifier(Modifier::BOLD), st)
@@ -337,8 +410,8 @@ fn draw_suggestions(f: &mut Frame, app: &App, area: Rect) {
             (Style::default().fg(Color::Cyan), dim())
         };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {}{pad}", s.text), cmd_style),
-            Span::styled(format!("{} ", s.desc), desc_style),
+            Span::styled(format!(" {command}{pad}"), cmd_style),
+            Span::styled(format!("{} ", truncate_text(&s.desc, desc_w)), desc_style),
         ]));
     }
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
@@ -464,8 +537,12 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
     let rect = centered(area, area.width.saturating_sub(4).clamp(20, 80), 18);
     let title = match picker.kind {
-        PickerKind::Model => " Choose model ",
-        PickerKind::Effort => " Reasoning effort ",
+        PickerKind::Model => format!(
+            " {}: {} ",
+            crate::config::text::get("model_source"),
+            picker.source
+        ),
+        PickerKind::Effort => " Reasoning effort ".into(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -489,10 +566,7 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
         .saturating_sub(height / 2)
         .min(items.len().saturating_sub(height));
     let lines: Vec<Line> = if items.is_empty() {
-        vec![Line::styled(
-            "No matches; Enter uses the typed text.",
-            dim(),
-        )]
+        vec![Line::styled(crate::config::text::get("no_matches"), dim())]
     } else {
         items
             .iter()
@@ -549,7 +623,7 @@ fn masked_key(key: &str) -> String {
 }
 
 fn draw_settings(f: &mut Frame, form: &SettingsForm, area: Rect) {
-    let rect = centered(area, area.width.saturating_sub(4).clamp(20, 100), 17);
+    let rect = centered(area, area.width.saturating_sub(4).clamp(20, 100), 21);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -576,12 +650,48 @@ fn draw_settings(f: &mut Frame, form: &SettingsForm, area: Rect) {
         format!("Backend: {backend}"),
         format!("Base URL: {}", settings.base_url),
         format!("API key: {key}"),
-        format!("Model: {}", settings.model),
+        format!(
+            "Model: {} · {}",
+            settings.model,
+            if settings.backend == Backend::Mistl {
+                "mistl"
+            } else {
+                settings
+                    .selected_provider()
+                    .map(|p| p.label.as_str())
+                    .unwrap_or(crate::config::text::get("unassigned"))
+            }
+        ),
         format!(
             "Reasoning effort: {}",
             settings.reasoning_effort.as_deref().unwrap_or("default")
         ),
         format!("Tool mode: {mode}"),
+        format!(
+            "{}: {}",
+            crate::config::text::get("connection"),
+            settings
+                .selected_provider()
+                .map(|p| p.label.as_str())
+                .unwrap_or(crate::config::text::get("unassigned"))
+        ),
+        format!(
+            "{}: {}",
+            crate::config::text::get("enabled"),
+            crate::config::text::get(if settings.selected_provider().is_some_and(|p| p.enabled) {
+                "yes"
+            } else {
+                "no"
+            })
+        ),
+        format!(
+            "{}: {}",
+            crate::config::text::get("label"),
+            settings
+                .selected_provider()
+                .map(|p| p.label.as_str())
+                .unwrap_or("")
+        ),
     ];
     let mut lines = Vec::new();
     let mut selected_line = 0;
@@ -624,6 +734,15 @@ fn draw_settings(f: &mut Frame, form: &SettingsForm, area: Rect) {
             Style::default().fg(Color::Yellow),
         ));
     }
+    if settings.backend == Backend::Custom
+        && !settings.selected_provider().is_some_and(|p| p.enabled)
+        && settings.default_ref.is_some()
+    {
+        lines.push(Line::styled(
+            crate::config::text::get("unavailable"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     // Keep the selected row visible even in a small terminal or with a long URL.
     let top = selected_line
         .saturating_sub(body.height as usize / 2)
@@ -633,10 +752,7 @@ fn draw_settings(f: &mut Frame, form: &SettingsForm, area: Rect) {
         body,
     );
     f.render_widget(
-        Paragraph::new(Line::styled(
-            "Ctrl+S save  Esc cancel  ↑↓/Tab move  Enter change",
-            dim(),
-        )),
+        Paragraph::new(Line::styled(crate::config::text::get("form_keys"), dim())),
         footer,
     );
 }
@@ -680,7 +796,7 @@ mod tests {
         assert!(text.contains("/help"));
         assert!(text.contains("show keys and commands"));
         assert!(
-            text.contains("1/18"),
+            text.contains("1/19"),
             "scroll position when the list overflows"
         );
         assert!(text.contains("Tab complete"));
@@ -691,6 +807,98 @@ mod tests {
         assert!(!text.contains("show keys and commands"));
         // Tiny terminals skip the popup instead of panicking.
         render(&mut app, 12, 6);
+    }
+
+    #[test]
+    fn renders_live_output_tail_expansion_and_final_replacement() {
+        let mut app = App::new(&UiInfo::from_config(&Config::default()));
+        app.entries.clear();
+        app.on_agent_event(AgentEvent::ToolStart {
+            id: "shell".into(),
+            title: "! command".into(),
+        });
+        app.on_agent_event(AgentEvent::ToolOutput {
+            id: "shell".into(),
+            chunk: (0..12).map(|i| format!("output-{i:02}\n")).collect(),
+        });
+        let transcript = |app: &App| {
+            build_transcript(app, 80)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = transcript(&app);
+        assert!(text.contains("! command"));
+        assert!(!text.contains("output-03"));
+        assert!(text.contains("output-04"));
+        assert!(text.contains("output-11"));
+        assert_eq!(text.lines().count(), 9);
+        app.expand_tools = true;
+        let text = transcript(&app);
+        assert!(text.contains("output-00"));
+        assert_eq!(text.lines().count(), 13);
+        app.on_agent_event(AgentEvent::ToolEnd {
+            id: "shell".into(),
+            ok: true,
+            output: "final output".into(),
+        });
+        let text = transcript(&app);
+        assert!(text.contains("final output"));
+        assert!(!text.contains("output-"));
+    }
+
+    #[test]
+    fn shell_input_uses_distinct_border_and_title() {
+        let mut app = App::new(&UiInfo::from_config(&Config::default()));
+        app.input.set("!echo hello");
+        app.busy = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let frame = terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            frame
+                .buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .contains(" ! shell ")
+        );
+        assert!(
+            frame
+                .buffer
+                .content
+                .iter()
+                .any(|c| c.symbol() == "!" && c.fg == Color::Yellow)
+        );
+        app.input.set("message");
+        let (text, _) = render(&mut app, 80, 12);
+        assert!(!text.contains(" ! shell "));
+    }
+
+    #[test]
+    fn workspace_header_shows_name_and_recipe_status_with_truncation() {
+        let mut info = UiInfo::from_config(&Config::default());
+        info.workspace.root = "parent/project".into();
+        info.workspace.justfile = Some("parent/justfile".into());
+        info.workspace.recipes = vec![crate::types::RecipeInfo::default(); 3];
+        let mut app = App::new(&info);
+        let (text, _) = render(&mut app, 100, 12);
+        assert!(text.contains("project just: 3 recipes"));
+        app.workspace.error = Some("could not load recipes".into());
+        let (text, _) = render(&mut app, 100, 12);
+        assert!(text.contains("project just: error"));
+        app.workspace.justfile = None;
+        let (text, _) = render(&mut app, 100, 12);
+        assert!(!text.contains("just:"));
+        app.workspace.root = format!("parent/{}", "long-name".repeat(20));
+        app.workspace.justfile = Some("parent/justfile".into());
+        let (text, _) = render(&mut app, 40, 12);
+        assert!(text.contains('…'));
+        assert!(text.contains("just: error"));
+        for width in [1, 8, 20] {
+            render(&mut app, width, 6);
+        }
     }
 
     #[test]
@@ -715,7 +923,7 @@ mod tests {
         });
         app.picker.as_mut().unwrap().selected = 70;
         let (text, cursor) = render(&mut app, 120, 30);
-        assert!(text.contains("Choose model"));
+        assert!(text.contains(crate::config::text::get("model_source")));
         assert!(text.contains("> model-070"));
         assert!(text.contains("100/100"));
         assert!(!text.contains("model-000"));
@@ -732,7 +940,7 @@ mod tests {
         assert!(text.contains("API key: •••••••••oken"));
         assert!(!text.contains("example-token"));
         assert!(text.contains("(set by the provider on the AI network)"));
-        assert!(text.contains("Ctrl+S save  Esc cancel"));
+        assert!(text.contains("Ctrl+S save"));
         assert!(!cursor);
         let (reply, _receive) = oneshot::channel();
         app.on_agent_event(AgentEvent::ApprovalRequest {

@@ -5,9 +5,12 @@ mod config;
 mod install;
 mod llm;
 mod mistl;
+mod process;
 mod prompt;
+mod tools;
 mod tui;
 mod types;
+mod workspace;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -45,7 +48,7 @@ struct Cli {
     /// mistl instance name (`mistl --instance`)
     #[arg(long)]
     instance: Option<String>,
-    /// Run state-changing mistl commands without asking
+    /// Run state-changing tools without asking
     #[arg(long, short = 'y')]
     yes: bool,
     /// Non-interactive: answer one prompt on stdout and exit (no TUI).
@@ -87,14 +90,16 @@ async fn main() -> Result<()> {
         },
     )?;
 
+    let ws = workspace::Workspace::detect(&std::env::current_dir()?, &cfg.just_bin);
     if cli.list_models {
-        return list_models(cfg).await;
+        return list_models(cfg, ws).await;
     }
     match cli.prompt {
-        Some(prompt) => headless(cfg, prompt).await,
+        Some(prompt) => headless(cfg, ws, prompt).await,
         None => {
-            let info = tui::UiInfo::from_config(&cfg);
-            let handle = agent::spawn(cfg)?;
+            let mut info = tui::UiInfo::from_config(&cfg);
+            info.workspace = ws.summary();
+            let handle = agent::spawn(cfg, ws)?;
             tui::run(info, handle).await
         }
     }
@@ -113,8 +118,8 @@ async fn install_mistl() -> Result<()> {
     Ok(())
 }
 
-async fn list_models(cfg: config::Config) -> Result<()> {
-    let mut handle = agent::spawn(cfg)?;
+async fn list_models(cfg: config::Config, ws: workspace::Workspace) -> Result<()> {
+    let mut handle = agent::spawn(cfg, ws)?;
     handle.commands.send(UserCommand::ListModels(None))?;
     while let Some(ev) = handle.events.recv().await {
         match ev {
@@ -134,8 +139,8 @@ async fn list_models(cfg: config::Config) -> Result<()> {
     anyhow::bail!("agent stopped before answering")
 }
 
-async fn headless(cfg: config::Config, prompt: String) -> Result<()> {
-    let mut handle = agent::spawn(cfg)?;
+async fn headless(cfg: config::Config, ws: workspace::Workspace, prompt: String) -> Result<()> {
+    let mut handle = agent::spawn(cfg, ws)?;
     handle.commands.send(UserCommand::Send(prompt))?;
     let mut out = std::io::stdout();
     let mut failed = false;
@@ -147,6 +152,11 @@ async fn headless(cfg: config::Config, prompt: String) -> Result<()> {
             }
             AgentEvent::AssistantDone => println!(),
             AgentEvent::ToolStart { title, .. } => eprintln!("\n[run] {title}"),
+            AgentEvent::ToolOutput { chunk, .. } => {
+                let mut err = std::io::stderr().lock();
+                err.write_all(chunk.as_bytes())?;
+                err.flush()?;
+            }
             AgentEvent::ToolEnd { ok, output, .. } => {
                 eprintln!(
                     "[{}] {}",

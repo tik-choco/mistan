@@ -11,12 +11,49 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::ToolMode;
 
+#[path = "llm_text.rs"]
+pub mod text;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     #[default]
     Mistl,
     Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub model: String,
+}
+
+/// Local HTTP connections. Room membership and sharing belong to mistl.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Provider {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub enabled: bool,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_fetched_at: Option<String>,
+}
+
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            enabled: true,
+            models: Vec::new(),
+            models_fetched_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -30,13 +67,21 @@ pub struct Config {
     pub tool_mode: ToolMode,
     /// OpenAI `reasoning_effort` (`low`, `medium`, `high`, ...); omitted when unset.
     pub reasoning_effort: Option<String>,
-    pub temperature: Option<f32>,
+    pub providers: Vec<Provider>,
+    pub default_ref: Option<ModelRef>,
+    /// Raw model id sent to mistl's API; empty lets mistl choose its default.
+    pub network_model: String,
     /// mistl executable (name on PATH or a full path).
     pub mistl_bin: String,
     /// Passed as `mistl --instance <name>` to target a specific instance.
     pub mistl_instance: Option<String>,
     /// Per-invocation timeout for mistl commands.
     pub mistl_timeout_secs: u64,
+    /// `just` executable (name on PATH or a full path) for justfile recipes.
+    pub just_bin: String,
+    /// Timeout for foreground recipes and shell commands run by the agent
+    /// (user `!` commands have none; Esc cancels them).
+    pub command_timeout_secs: u64,
     /// Max model round-trips per user message.
     pub max_steps: usize,
     /// Run mutating mistl commands without asking.
@@ -55,10 +100,14 @@ impl Default for Config {
             // Native tools on the AI network, with session fallback to prompt mode.
             tool_mode: ToolMode::Native,
             reasoning_effort: None,
-            temperature: None,
+            providers: Vec::new(),
+            default_ref: None,
+            network_model: String::new(),
             mistl_bin: "mistl".into(),
             mistl_instance: None,
             mistl_timeout_secs: 60,
+            just_bin: "just".into(),
+            command_timeout_secs: 600,
             max_steps: 12,
             auto_approve: false,
             config_path: None,
@@ -77,9 +126,14 @@ struct FileConfig {
     tool_mode: Option<ToolMode>,
     reasoning_effort: Option<String>,
     temperature: Option<f32>,
+    providers: Option<Vec<Provider>>,
+    default_ref: Option<ModelRef>,
+    network_model: Option<String>,
     mistl_bin: Option<String>,
     mistl_instance: Option<String>,
     mistl_timeout_secs: Option<u64>,
+    just_bin: Option<String>,
+    command_timeout_secs: Option<u64>,
     max_steps: Option<usize>,
     auto_approve: Option<bool>,
 }
@@ -110,12 +164,28 @@ pub fn load(explicit: Option<&Path>, ov: Overrides) -> Result<Config> {
     if let Some(path) = path.filter(|p| explicit.is_some() || p.exists()) {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let file: FileConfig =
+        let _: FileConfig =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let mut table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if migrate_file(&mut table)? {
+            // Persist before applying environment/CLI overrides or keys.
+            write_table(&path, &table)?;
+        }
+        let file: FileConfig = table
+            .try_into()
+            .with_context(|| format!("parsing {}", path.display()))?;
         file_backend = file.backend;
         tool_mode = tool_mode.or(file.tool_mode);
         apply_file(&mut cfg, file);
     }
+
+    cfg.backend = file_backend.unwrap_or(if cfg.default_ref.is_some() {
+        Backend::Custom
+    } else {
+        Backend::Mistl
+    });
+    cfg.resolve_default()?;
 
     if let Some(key) = env_nonempty("MISTAN_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY")) {
         cfg.api_key = Some(key);
@@ -146,6 +216,7 @@ pub fn load(explicit: Option<&Path>, ov: Overrides) -> Result<Config> {
     cfg.auto_approve |= ov.auto_approve;
 
     select_backend(&mut cfg, file_backend, tool_mode)?;
+    cfg.capture_selection();
     cfg.mistl_bin = resolve_mistl_bin(&cfg.mistl_bin);
     Ok(cfg)
 }
@@ -156,7 +227,7 @@ fn select_backend(
     tool_mode: Option<ToolMode>,
 ) -> Result<()> {
     cfg.backend = explicit.unwrap_or_else(|| {
-        if cfg.base_url.is_some() {
+        if cfg.base_url.is_some() || cfg.default_ref.is_some() {
             Backend::Custom
         } else {
             Backend::Mistl
@@ -167,7 +238,9 @@ fn select_backend(
         .take()
         .map(|url| url.trim().trim_end_matches('/').to_string());
     match cfg.backend {
-        Backend::Custom if cfg.base_url.as_deref().is_none_or(str::is_empty) => {
+        Backend::Custom
+            if cfg.base_url.as_deref().is_none_or(str::is_empty) && cfg.default_ref.is_none() =>
+        {
             bail!("custom backend requires base_url (config, MISTAN_BASE_URL, or --base-url)");
         }
         _ => {}
@@ -185,6 +258,8 @@ fn apply_file(cfg: &mut Config, f: FileConfig) {
         tool_mode,
         mistl_bin,
         mistl_timeout_secs,
+        just_bin,
+        command_timeout_secs,
         max_steps,
         auto_approve
     );
@@ -197,12 +272,151 @@ fn apply_file(cfg: &mut Config, f: FileConfig) {
     if f.reasoning_effort.is_some() {
         cfg.reasoning_effort = f.reasoning_effort;
     }
-    if f.temperature.is_some() {
-        cfg.temperature = f.temperature;
-    }
+    // Legacy temperature is read only; never sent or saved.
+    let _ = f.temperature;
+    cfg.providers = f.providers.unwrap_or_default();
+    cfg.default_ref = f.default_ref;
+    cfg.network_model = f.network_model.unwrap_or_default();
     if f.mistl_instance.is_some() {
         cfg.mistl_instance = f.mistl_instance;
     }
+}
+
+impl Config {
+    fn resolve_default(&mut self) -> Result<()> {
+        if self.backend == Backend::Mistl {
+            self.model = self.network_model.clone();
+            return Ok(());
+        }
+        if let Some(reference) = &self.default_ref {
+            self.model = reference.model.clone();
+            let Some(p) = self
+                .providers
+                .iter()
+                .find(|p| p.id == reference.provider_id && p.enabled)
+            else {
+                self.base_url = None;
+                self.api_key = None;
+                return Ok(());
+            };
+            if p.base_url.starts_with("mist-network://") {
+                bail!("{}", text::get("rooms_in_mistl"));
+            }
+            self.base_url = Some(p.base_url.clone());
+            self.api_key = (!p.api_key.is_empty()).then(|| p.api_key.clone());
+            self.model = reference.model.clone();
+        }
+        Ok(())
+    }
+
+    /// Record the selected model without replacing a stored provider reference.
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+        if self.backend == Backend::Mistl {
+            self.network_model = self.model.clone();
+        } else if let Some(reference) = &mut self.default_ref {
+            reference.model = self.model.clone();
+        }
+    }
+
+    fn capture_selection(&mut self) {
+        if self.backend == Backend::Mistl {
+            self.network_model = self.model.clone();
+            return;
+        }
+        let id = self.default_ref.as_ref().map(|r| r.provider_id.clone());
+        if let Some(p) = self
+            .providers
+            .iter_mut()
+            .find(|p| Some(&p.id) == id.as_ref())
+        {
+            if let Some(url) = &self.base_url {
+                p.base_url = url.clone();
+            }
+        } else {
+            let id = unique_provider_id(
+                &self.providers,
+                self.default_ref.as_ref().map(|r| r.provider_id.as_str()),
+            );
+            self.providers.push(Provider {
+                id: id.clone(),
+                label: "HTTP".into(),
+                base_url: self.base_url.clone().unwrap_or_default(),
+                ..Provider::default()
+            });
+            self.default_ref = Some(ModelRef {
+                provider_id: id,
+                model: self.model.clone(),
+            });
+        }
+        if let Some(reference) = &mut self.default_ref {
+            reference.model = self.model.clone();
+        }
+    }
+}
+
+pub fn unique_provider_id(providers: &[Provider], reserved: Option<&str>) -> String {
+    (1..)
+        .map(|i| format!("http-{i}"))
+        .find(|id| reserved != Some(id.as_str()) && providers.iter().all(|p| p.id != *id))
+        .unwrap()
+}
+
+/// Upgrade only the old flat connection; never infer a default from array order.
+fn migrate_file(table: &mut toml::Table) -> Result<bool> {
+    let before = table.clone();
+    if !table.contains_key("providers") {
+        let url = table
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let model = table
+            .get("model")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let custom = table
+            .get("backend")
+            .and_then(toml::Value::as_str)
+            .map_or(!url.is_empty(), |b| b == "custom");
+        let mut providers = Vec::new();
+        if !url.is_empty() {
+            providers.push(Provider {
+                id: "http-1".into(),
+                label: "HTTP".into(),
+                base_url: url.trim_end_matches('/').into(),
+                api_key: table
+                    .get("api_key")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                models: (!model.is_empty() && custom)
+                    .then(|| model.to_string())
+                    .into_iter()
+                    .collect(),
+                ..Provider::default()
+            });
+        }
+        if custom && !providers.is_empty() && !table.contains_key("default_ref") {
+            table.insert(
+                "default_ref".into(),
+                toml::Value::try_from(ModelRef {
+                    provider_id: "http-1".into(),
+                    model: model.clone(),
+                })?,
+            );
+        }
+        if !custom && !model.is_empty() && !table.contains_key("network_model") {
+            table.insert("network_model".into(), model.into());
+        }
+        table.insert("providers".into(), toml::Value::try_from(providers)?);
+    }
+    for key in ["base_url", "api_key", "model", "temperature"] {
+        table.remove(key);
+    }
+    Ok(*table != before)
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -248,24 +462,42 @@ pub struct LlmSettings {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub tool_mode: ToolMode,
+    pub providers: Vec<Provider>,
+    pub default_ref: Option<ModelRef>,
+    pub network_model: String,
 }
 
 impl LlmSettings {
     pub fn from_config(cfg: &Config) -> Self {
+        let provider = cfg
+            .default_ref
+            .as_ref()
+            .and_then(|r| cfg.providers.iter().find(|p| p.id == r.provider_id));
         Self {
             backend: cfg.backend,
-            base_url: cfg.base_url.clone().unwrap_or_default(),
-            api_key: cfg.api_key.clone(),
+            base_url: cfg
+                .base_url
+                .clone()
+                .or_else(|| provider.map(|p| p.base_url.clone()))
+                .unwrap_or_default(),
+            api_key: cfg.api_key.clone().or_else(|| {
+                provider
+                    .filter(|p| !p.api_key.is_empty())
+                    .map(|p| p.api_key.clone())
+            }),
             model: cfg.model.clone(),
             reasoning_effort: cfg.reasoning_effort.clone(),
             tool_mode: cfg.tool_mode,
+            providers: cfg.providers.clone(),
+            default_ref: cfg.default_ref.clone(),
+            network_model: cfg.network_model.clone(),
         }
     }
 
     /// Validate and apply to `cfg`.
     pub fn apply(&self, cfg: &mut Config) -> Result<()> {
         let url = self.base_url.trim().trim_end_matches('/').to_string();
-        if self.backend == Backend::Custom && url.is_empty() {
+        if self.backend == Backend::Custom && url.is_empty() && self.default_ref.is_none() {
             bail!("the OpenAI-compatible API needs a base URL");
         }
         cfg.backend = self.backend;
@@ -274,7 +506,92 @@ impl LlmSettings {
         cfg.model = self.model.trim().to_string();
         cfg.reasoning_effort = normalize_effort(self.reasoning_effort.clone());
         cfg.tool_mode = self.tool_mode;
+        let canonical = self.canonical()?;
+        cfg.providers = canonical.providers;
+        cfg.default_ref = canonical.default_ref;
+        cfg.network_model = canonical.network_model;
+        cfg.resolve_default()?;
+        // Keys from the environment are runtime-only.
+        if let Some(key) = env_nonempty("MISTAN_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY"))
+        {
+            cfg.api_key = Some(key);
+        }
         Ok(())
+    }
+
+    pub fn selected_provider(&self) -> Option<&Provider> {
+        let id = &self.default_ref.as_ref()?.provider_id;
+        self.providers.iter().find(|p| &p.id == id)
+    }
+
+    /// Commit the form's fields to its selected connection only.
+    pub fn canonical(&self) -> Result<Self> {
+        let mut s = self.clone();
+        let env_key = env_nonempty("MISTAN_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY"));
+        if s.backend == Backend::Mistl {
+            s.network_model = s.model.trim().into();
+            return Ok(s);
+        }
+        if s.default_ref.is_none() {
+            let id = unique_provider_id(&s.providers, None);
+            s.providers.push(Provider {
+                id: id.clone(),
+                label: "HTTP".into(),
+                ..Provider::default()
+            });
+            s.default_ref = Some(ModelRef {
+                provider_id: id,
+                model: s.model.trim().into(),
+            });
+        }
+        let reference = s.default_ref.as_mut().unwrap();
+        reference.model = s.model.trim().into();
+        if let Some(p) = s
+            .providers
+            .iter_mut()
+            .find(|p| p.id == reference.provider_id)
+        {
+            if !s.base_url.trim().is_empty() {
+                p.base_url = s.base_url.trim().trim_end_matches('/').into();
+            }
+            if let Some(key) = s
+                .api_key
+                .as_deref()
+                .filter(|k| env_key.as_deref() != Some(*k))
+            {
+                p.api_key = key.into();
+            }
+            if p.base_url.starts_with("mist-network://") {
+                bail!("{}", text::get("rooms_in_mistl"));
+            }
+            if p.enabled
+                && reqwest::Url::parse(&p.base_url).ok().is_none_or(|u| {
+                    !matches!(u.scheme(), "http" | "https") || u.host_str().is_none()
+                })
+            {
+                bail!("{}", text::get("invalid_url"));
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn select_provider(&mut self, id: &str) {
+        if let Some(p) = self.providers.iter().find(|p| p.id == id) {
+            self.backend = Backend::Custom;
+            self.base_url = p.base_url.clone();
+            self.api_key = (!p.api_key.is_empty()).then(|| p.api_key.clone());
+            let model = self
+                .default_ref
+                .as_ref()
+                .filter(|r| r.provider_id == id)
+                .map(|r| r.model.clone())
+                .unwrap_or_default();
+            self.model = model.clone();
+            self.default_ref = Some(ModelRef {
+                provider_id: id.into(),
+                model,
+            });
+        }
     }
 }
 
@@ -295,6 +612,7 @@ pub fn save_settings(path: &Path, s: &LlmSettings) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
+    let s = s.canonical()?;
     let backend = match s.backend {
         Backend::Mistl => "mistl",
         Backend::Custom => "custom",
@@ -305,29 +623,27 @@ pub fn save_settings(path: &Path, s: &LlmSettings) -> Result<()> {
     };
     table.insert("backend".into(), backend.into());
     table.insert("tool_mode".into(), tool_mode.into());
-    table.insert("model".into(), s.model.trim().into());
-    let url = s.base_url.trim().trim_end_matches('/');
-    if url.is_empty() {
-        table.remove("base_url");
-    } else {
-        table.insert("base_url".into(), url.into());
+    for key in ["base_url", "api_key", "model", "temperature"] {
+        table.remove(key);
     }
+    table.insert("providers".into(), toml::Value::try_from(&s.providers)?);
+    match &s.default_ref {
+        Some(r) => {
+            table.insert("default_ref".into(), toml::Value::try_from(r)?);
+        }
+        None => {
+            table.remove("default_ref");
+        }
+    }
+    table.insert("network_model".into(), s.network_model.as_str().into());
     match normalize_effort(s.reasoning_effort.clone()) {
         Some(e) => table.insert("reasoning_effort".into(), e.into()),
         None => table.remove("reasoning_effort"),
     };
-    // An empty key never erases a stored one by accident; clearing it is done
-    // by editing the file.
-    // A key that came from the environment is never copied into the file.
-    let env_key = env_nonempty("MISTAN_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY"));
-    if let Some(k) = s
-        .api_key
-        .as_deref()
-        .filter(|k| !k.trim().is_empty() && env_key.as_deref() != Some(*k))
-    {
-        table.insert("api_key".into(), k.into());
-    }
+    write_table(path, &table)
+}
 
+fn write_table(path: &Path, table: &toml::Table) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -463,15 +779,18 @@ mod tests {
             model: " m1 ".into(),
             reasoning_effort: Some("High".into()),
             tool_mode: ToolMode::Native,
+            ..LlmSettings::from_config(&Config::default())
         };
         save_settings(&path, &s).unwrap();
         let file: FileConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(file.max_steps, Some(5));
         assert_eq!(file.backend, Some(Backend::Custom));
-        assert_eq!(file.base_url.as_deref(), Some("https://example.invalid/v1"));
-        assert_eq!(file.model.as_deref(), Some("m1"));
+        let provider = &file.providers.as_ref().unwrap()[0];
+        assert_eq!(provider.base_url, "https://example.invalid/v1");
+        assert_eq!(file.default_ref.as_ref().unwrap().model, "m1");
         assert_eq!(file.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(file.api_key.as_deref(), Some("file-key-not-from-env"));
+        assert_eq!(provider.api_key, "file-key-not-from-env");
+        assert!(file.base_url.is_none() && file.model.is_none() && file.api_key.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -486,5 +805,105 @@ mod tests {
         s.base_url = "http://x/v1/".into();
         s.apply(&mut cfg).unwrap();
         assert_eq!(cfg.base_url.as_deref(), Some("http://x/v1"));
+    }
+
+    #[test]
+    fn flat_config_migration_is_idempotent_and_preserves_options() {
+        let mut table: toml::Table = toml::from_str("base_url = 'https://example.invalid/v1/'\napi_key = 'legacy-test-key'\nmodel = 'raw-model'\ntemperature = 0.2\nreasoning_effort = 'high'\nmax_steps = 7\n").unwrap();
+        assert!(migrate_file(&mut table).unwrap());
+        assert!(!migrate_file(&mut table).unwrap());
+        let file: FileConfig = table.clone().try_into().unwrap();
+        let p = &file.providers.unwrap()[0];
+        assert_eq!(p.id, "http-1");
+        assert_eq!(p.api_key, "legacy-test-key");
+        assert_eq!(p.models, ["raw-model"]);
+        assert!(p.enabled);
+        assert_eq!(
+            file.default_ref.unwrap(),
+            ModelRef {
+                provider_id: p.id.clone(),
+                model: "raw-model".into()
+            }
+        );
+        assert_eq!(file.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(file.max_steps, Some(7));
+        for key in ["base_url", "api_key", "model", "temperature"] {
+            assert!(!table.contains_key(key));
+        }
+        assert!(
+            !table.contains_key("backend"),
+            "keep inferred backend overridable by environment"
+        );
+    }
+
+    #[test]
+    fn network_migration_keeps_raw_model_and_explicit_backend() {
+        let mut table: toml::Table = toml::from_str("backend = 'mistl'\nbase_url = 'https://example.invalid/v1'\nmodel = 'network-model'\ntemperature = 0.9\n").unwrap();
+        assert!(migrate_file(&mut table).unwrap());
+        let file: FileConfig = table.try_into().unwrap();
+        assert_eq!(file.backend, Some(Backend::Mistl));
+        assert_eq!(file.network_model.as_deref(), Some("network-model"));
+        assert!(file.default_ref.is_none());
+        assert_eq!(file.providers.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_config_keeps_missing_and_disabled_references() {
+        for enabled in [true, false] {
+            let mut cfg = Config::default();
+            let mut s = LlmSettings::from_config(&cfg);
+            s.backend = Backend::Custom;
+            s.providers = vec![Provider {
+                id: "p".into(),
+                base_url: "https://example.invalid/v1".into(),
+                enabled,
+                ..Provider::default()
+            }];
+            s.default_ref = Some(ModelRef {
+                provider_id: "p".into(),
+                model: "raw".into(),
+            });
+            s.model = "raw".into();
+            s.apply(&mut cfg).unwrap();
+            assert_eq!(cfg.default_ref, s.default_ref);
+            assert_eq!(cfg.base_url.is_some(), enabled);
+            s.providers.clear();
+            s.apply(&mut cfg).unwrap();
+            assert_eq!(cfg.default_ref, s.default_ref);
+            assert!(cfg.base_url.is_none());
+        }
+    }
+
+    #[test]
+    fn load_migrates_file_once_before_session_overrides() {
+        let dir =
+            std::env::temp_dir().join(format!("mistan-migration-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "base_url = 'https://example.invalid/v1'\nmodel = 'stored'\ntemperature = 0.4\n",
+        )
+        .unwrap();
+        let cfg = load(
+            Some(&path),
+            Overrides {
+                model: Some("session".into()),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.backend, Backend::Custom);
+        assert_eq!(cfg.model, "session");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let file: FileConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(file.default_ref.unwrap().model, "stored");
+        load(Some(&path), Overrides::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        std::fs::write(&path, "unknown = true\ntemperature = 0.4\n").unwrap();
+        let invalid = std::fs::read_to_string(&path).unwrap();
+        assert!(load(Some(&path), Overrides::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

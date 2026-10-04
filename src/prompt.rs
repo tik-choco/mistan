@@ -5,42 +5,40 @@ use serde_json::json;
 use crate::mistl::{TOOL_HELP, TOOL_MISTL, split_args};
 use crate::types::{FunctionCall, ToolCall, ToolMode, ToolOutput};
 
-/// System prompt when no mistl executable is available: plain chat, no tools.
-pub fn system_prompt_plain() -> String {
-    "You are mistan, a terminal assistant for the tik-choco ecosystem. The mistl CLI is not \
-installed on this machine, so you cannot run commands or inspect the user's mistl node. Answer \
-in the user's language, keep answers short, and never claim to have run anything. If the user \
-wants you to operate mistl, tell them to run `/mistl install` (or `mistan --install-mistl`) \
-and then start a new message.\n"
-        .into()
-}
-
-pub fn system_prompt(mode: ToolMode, catalog: &str) -> String {
+pub fn system_prompt(mode: ToolMode, mistl_ready: bool, catalog: &str, workspace: &str) -> String {
     let mut s = String::from(
-        "You are mistan, an assistant that operates the user's local mistl node by calling the \
-mistl CLI. mistl is the P2P daemon of the tik-choco ecosystem: identity/DID, content store, \
-stream, chat relay, tunnel, AI network, scheduler, and bot pipelines.\n\
+        "You are mistan, a terminal assistant for the user's workspace and the tik-choco ecosystem.\n\
 \n\
 Rules:\n\
 - Answer in the user's language.\n\
-- Use mistl help before guessing the syntax of an unfamiliar subcommand.\n\
 - Prefer read-only queries to inspect state before changing anything.\n\
 - State-changing commands need the user's approval and may be declined; respect a refusal and do not retry the same command.\n\
 - Never invent command output; base answers on actual results.\n\
 - Keep answers short. Many commands print JSON; summarize it for humans instead of pasting it.\n\
 - Never print or request secrets. Use a passphrase only if the user provides it.\n",
     );
+    if mistl_ready {
+        s.push_str("\nMistl: operate the local P2P node with `mistl` (args array, no leading mistl) and `mistl_help` (command path). Use help before guessing unfamiliar syntax.\nCommand overview (`mistl --help`):\n");
+        s.push_str(catalog.trim());
+        s.push_str("\nAI settings: inspect `mistl config show` and subcommand help first. New mistl uses ai.providers (HTTP or mist-network://<room>, enabled/models/provide/shared), ai.default_ref = {provider_id, model}, ai.tts and ai.stt. ai.status reports rooms[]. Model ids on the network are raw ids. Do not create presets, set default_preset_id/advertised_models, or send temperature. Older mistl may omit these fields; follow its actual config and help.\n");
+        s.push('\n');
+    } else {
+        s.push_str("\nMistl is unavailable; workspace tools still work. To operate a mistl node, suggest `/mistl install`.\n");
+    }
+    s.push_str("\nWorkspace:\n");
+    s.push_str(workspace.trim());
+    s.push_str("\nUse the justfile to learn how the project builds and runs; prefer its recipes over raw commands.\n\
+Use list_dir, find_files, and read_file to locate build outputs; find_files needs include_ignored: true for ignored directories such as target/.\n\
+Tools: just(recipe, args, background), list_dir(path?), find_files(glob, include_ignored), grep(pattern, path?, glob?, case_insensitive), read_file(path, offset?, limit?), shell(command, background), process_list(), process_output(id, tail_bytes?), process_stop(id). File paths stay within the workspace.\n\
+Run long-lived programs (servers, GUI/TUI apps) with background: true; inspect with process_output and stop with process_stop. stdin is null, so interactive programs may exit or misbehave.\n");
     match mode {
         ToolMode::Native => {
-            s.push_str(
-                "\nTools: `mistl` runs the CLI with an args array (no leading \"mistl\"); \
-`mistl_help` shows `mistl <command> --help`.\n",
-            );
+            s.push_str("\nUse the provided native tools when a tool is needed.\n");
         }
         ToolMode::Prompt => {
-            s.push_str(
-                "\nTool protocol:\n\
-To run a mistl command, output a fenced block (one command per block, shell-style quoting, no leading \"mistl\"):\n\
+            if mistl_ready {
+                s.push_str(
+                    "\nFor mistl, output a fenced block (shell-style quoting, no leading mistl):\n\
 ```mistl\n\
 store ls\n\
 ```\n\
@@ -48,14 +46,20 @@ To read help for a subcommand:\n\
 ```mistl-help\n\
 store folder-share\n\
 ```\n\
-After emitting blocks, STOP and wait. The results arrive in the next user message starting with `[mistl results]`. \
-When no tool is needed, answer normally without any such blocks.\n",
-            );
+",
+                );
+            }
+            s.push_str("\nTool protocol: use a ```just block with one recipe per line, shell-style quoting, e.g.:\n\
+```just\n\
+build --release\n\
+```\n\
+For other tools (or just with background: true), use a ```tool block containing exactly one JSON object; it may span lines:\n\
+```tool\n\
+{\"name\":\"read_file\",\"arguments\":{\"path\":\"src/main.rs\"}}\n\
+```\n\
+After emitting blocks, STOP and wait for the next user message starting with [tool results]. When no tool is needed, answer normally.\n");
         }
     }
-    s.push_str("\n## mistl command overview (`mistl --help`)\n");
-    s.push_str(catalog.trim());
-    s.push('\n');
     s
 }
 
@@ -65,11 +69,14 @@ pub fn parse_prompt_calls(text: &str) -> Vec<ToolCall> {
     enum Kind {
         Mistl,
         Help,
+        Just,
+        Tool,
         Shell,
         Other,
     }
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut kind: Option<Kind> = None;
+    let mut body = String::new();
 
     let mut push = |name: &str, arguments: String| {
         calls.push(ToolCall {
@@ -91,6 +98,8 @@ pub fn parse_prompt_calls(text: &str) -> Vec<ToolCall> {
                     kind = Some(match lang.as_str() {
                         "mistl" => Kind::Mistl,
                         "mistl-help" => Kind::Help,
+                        "just" => Kind::Just,
+                        "tool" => Kind::Tool,
                         "sh" | "bash" | "shell" | "console" => Kind::Shell,
                         _ => Kind::Other,
                     });
@@ -98,7 +107,17 @@ pub fn parse_prompt_calls(text: &str) -> Vec<ToolCall> {
             }
             Some(k) => {
                 if line.starts_with("```") {
+                    if *k == Kind::Tool {
+                        let (name, arguments) = json_call(&body);
+                        push(&name, arguments);
+                        body.clear();
+                    }
                     kind = None;
+                    continue;
+                }
+                if *k == Kind::Tool {
+                    body.push_str(raw);
+                    body.push('\n');
                     continue;
                 }
                 if line.is_empty() || line.starts_with('#') {
@@ -112,6 +131,14 @@ pub fn parse_prompt_calls(text: &str) -> Vec<ToolCall> {
                     Kind::Help => {
                         push(TOOL_HELP, json!({ "command": line }).to_string());
                     }
+                    Kind::Just => {
+                        let mut words = split_args(line.strip_prefix("$ ").unwrap_or(line));
+                        if !words.is_empty() {
+                            let recipe = words.remove(0);
+                            push("just", json!({"recipe": recipe, "args": words}).to_string());
+                        }
+                    }
+                    Kind::Tool => unreachable!(),
                     Kind::Shell => {
                         let l = line.strip_prefix("$ ").unwrap_or(line);
                         if l.starts_with("mistl ") {
@@ -123,13 +150,38 @@ pub fn parse_prompt_calls(text: &str) -> Vec<ToolCall> {
             }
         }
     }
+    if kind == Some(Kind::Tool) {
+        // An unterminated JSON tool block is an error, never silently discarded.
+        push(
+            "invalid_tool",
+            json!({"error": "unterminated tool block", "body": body}).to_string(),
+        );
+    }
     calls
+}
+
+fn json_call(body: &str) -> (String, String) {
+    let parsed = serde_json::from_str::<serde_json::Value>(body);
+    if let Ok(value) = &parsed
+        && let Some(name) = value.get("name").and_then(|v| v.as_str())
+        && let Some(arguments) = value.get("arguments").filter(|v| v.is_object())
+    {
+        return (name.into(), arguments.to_string());
+    }
+    let error = match parsed {
+        Err(e) => format!("invalid tool block JSON: {e}"),
+        Ok(_) => "tool block requires a name and an arguments object".into(),
+    };
+    (
+        "invalid_tool".into(),
+        json!({"error": error, "body": body}).to_string(),
+    )
 }
 
 /// Build the user-role message that feeds prompt-mode results back. Each entry
 /// is `(title, output)`.
 pub fn format_prompt_results(results: &[(String, ToolOutput)]) -> String {
-    let mut s = String::from("[mistl results]\n");
+    let mut s = String::from("[tool results]\n");
     for (title, out) in results {
         s.push_str("$ ");
         s.push_str(title);
@@ -211,17 +263,75 @@ mod tests {
             ),
         ];
         let s = format_prompt_results(&r);
-        assert!(s.starts_with("[mistl results]\n$ mistl store ls\nexit code: 0\nstatus: ok\n"));
+        assert!(s.starts_with("[tool results]\n$ mistl store ls\nexit code: 0\nstatus: ok\n"));
         assert!(s.ends_with("$ mistl x\nboom\nstatus: failed\n"));
     }
 
     #[test]
     fn prompt_modes() {
-        let p = system_prompt(ToolMode::Prompt, "CATALOG");
+        let p = system_prompt(ToolMode::Prompt, true, "CATALOG", "WORKSPACE");
         assert!(
-            p.contains("```mistl-help") && p.contains("CATALOG") && p.contains("[mistl results]")
+            p.contains("```mistl-help") && p.contains("CATALOG") && p.contains("[tool results]")
         );
-        let n = system_prompt(ToolMode::Native, "CATALOG");
+        let n = system_prompt(ToolMode::Native, true, "CATALOG", "WORKSPACE");
         assert!(!n.contains("```mistl") && n.contains("CATALOG"));
+        let workspace_only = system_prompt(ToolMode::Prompt, false, "CATALOG", "WORKSPACE");
+        assert!(workspace_only.contains("WORKSPACE") && workspace_only.contains("```tool"));
+        assert!(!workspace_only.contains("CATALOG") && !workspace_only.contains("```mistl"));
+        assert!(
+            workspace_only.contains("include_ignored: true")
+                && workspace_only.contains("background: true")
+        );
+    }
+
+    #[test]
+    fn parses_just_and_multiline_json_in_order() {
+        let text = "```just\nbuild --release\ndocs::serve \"two words\"\n```\n```tool\n{\n  \"name\": \"shell\",\n  \"arguments\": {\"command\": \"echo hi\", \"background\": true}\n}\n```\n```tool\n{\"name\":\"process_list\",\"arguments\":{}}\n```";
+        let calls = parse_prompt_calls(text);
+        assert_eq!(calls.len(), 4);
+        let invs = calls
+            .iter()
+            .map(|call| {
+                crate::tools::parse_call(&call.function.name, &call.function.arguments).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(&invs[0], crate::tools::Invocation::Just { recipe, args, background: false } if recipe == "build" && args == &["--release"])
+        );
+        assert!(
+            matches!(&invs[1], crate::tools::Invocation::Just { recipe, args, .. } if recipe == "docs::serve" && args == &["two words"])
+        );
+        assert!(
+            matches!(&invs[2], crate::tools::Invocation::Shell { command, background: true } if command == "echo hi")
+        );
+        assert_eq!(invs[3], crate::tools::Invocation::ProcessList);
+        assert_eq!(calls[3].id, "p4");
+    }
+
+    #[test]
+    fn malformed_json_blocks_produce_errors() {
+        for body in [
+            "{bad",
+            "",
+            "[]",
+            "{}",
+            r#"{"name":"shell","arguments":"echo hi"}"#,
+            r#"{"name":"process_list","arguments":{}} {"name":"process_list","arguments":{}}"#,
+        ] {
+            let calls = parse_prompt_calls(&format!("```tool\n{body}\n```"));
+            assert_eq!(calls.len(), 1, "{body}");
+            let err =
+                crate::tools::parse_call(&calls[0].function.name, &calls[0].function.arguments)
+                    .unwrap_err();
+            assert!(err.to_string().contains("tool block"));
+        }
+        let calls = parse_prompt_calls("```tool\n{\"name\":\"process_list\",\"arguments\":{}}");
+        assert_eq!(calls.len(), 1);
+        assert!(
+            crate::tools::parse_call(&calls[0].function.name, &calls[0].function.arguments)
+                .unwrap_err()
+                .to_string()
+                .contains("unterminated")
+        );
     }
 }

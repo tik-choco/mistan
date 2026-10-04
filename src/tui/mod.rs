@@ -32,6 +32,8 @@ pub struct UiInfo {
     pub base_url: String,
     pub tool_mode: crate::types::ToolMode,
     pub auto_approve: bool,
+    /// The startup directory and its justfile (set by main after detection).
+    pub workspace: crate::types::WorkspaceSummary,
 }
 
 impl UiInfo {
@@ -48,6 +50,7 @@ impl UiInfo {
             },
             tool_mode: cfg.tool_mode,
             auto_approve: cfg.auto_approve,
+            workspace: Default::default(),
         }
     }
 }
@@ -79,6 +82,9 @@ pub async fn run(info: UiInfo, handle: AgentHandle) -> Result<()> {
     result
 }
 
+/// Upper bound on queued agent events applied between two redraws.
+const MAX_EVENTS_PER_FRAME: usize = 4096;
+
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     info: UiInfo,
@@ -108,7 +114,18 @@ async fn event_loop(
                 None => break,
             },
             ev = handle.events.recv(), if !app.events_closed => match ev {
-                Some(ev) => app.on_agent_event(ev),
+                Some(ev) => {
+                    app.on_agent_event(ev);
+                    // Apply everything already queued (e.g. a burst of live
+                    // command output) before the next redraw, so drawing
+                    // never falls behind a fast producer.
+                    for _ in 0..MAX_EVENTS_PER_FRAME {
+                        match handle.events.try_recv() {
+                            Ok(ev) => app.on_agent_event(ev),
+                            Err(_) => break,
+                        }
+                    }
+                }
                 None => app.on_events_closed(),
             },
             _ = tick.tick() => app.on_tick(),

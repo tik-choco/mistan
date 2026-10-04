@@ -1,7 +1,8 @@
-//! Agent loop: model <-> mistl tool round-trips.
+//! Agent loop: model/tool round-trips and direct workspace shell commands.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
@@ -10,12 +11,15 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{self, Backend, Config, LlmSettings};
 use crate::install;
 use crate::llm::{LlmClient, is_tools_unsupported};
-use crate::mistl::{self, MistlRunner};
+use crate::mistl;
+use crate::process;
 use crate::prompt;
+use crate::tools::{self, Toolbox};
 use crate::types::{
     AgentEvent, Approval, Message, MistlOp, Role, Safety, ToolCall, ToolMode, ToolOutput,
     UserCommand,
 };
+use crate::workspace::Workspace;
 
 pub struct AgentHandle {
     pub commands: mpsc::UnboundedSender<UserCommand>,
@@ -33,7 +37,10 @@ impl AgentHandle {
 struct Agent {
     cfg: Config,
     llm: LlmClient,
-    runner: MistlRunner,
+    toolbox: Toolbox,
+    workspace_prompt: String,
+    pending_shell: PendingShell,
+    shell_sequence: u64,
     messages: Vec<Message>,
     mode: ToolMode,
     catalog: String,
@@ -42,13 +49,47 @@ struct Agent {
     /// mistl backend it needs the daemon and `ai serve`).
     endpoint_ready: bool,
     /// mistl was found when the session started, so the mistl tools are on.
-    /// Without it mistan is a plain chat client.
+    /// Workspace tools remain available without mistl.
     mistl_ready: bool,
     tx: mpsc::UnboundedSender<AgentEvent>,
+    model_catalog: HashMap<String, CachedModels>,
+}
+
+struct CachedModels {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    fetched: Instant,
+    models: Vec<String>,
 }
 
 const NO_MISTL_HINT: &str = "mistl was not found. Run /mistl install (or `mistan --install-mistl`) \
 to download it, or point mistan at it with --mistl / mistl_bin.";
+
+#[derive(Default)]
+struct PendingShell(Vec<String>);
+
+impl PendingShell {
+    fn push(&mut self, command: &str, output: &ToolOutput) {
+        self.0.push(format!(
+            "[The user ran a shell command in the workspace]\n$ {command}\n{}",
+            output.text
+        ));
+    }
+
+    fn prepend(&mut self, text: String) -> String {
+        if self.0.is_empty() {
+            return text;
+        }
+        let mut notes = std::mem::take(&mut self.0).join("\n\n");
+        notes.push_str("\n\n");
+        notes.push_str(&text);
+        notes
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
 
 /// Rewrite native tool history without retaining any tool-only wire fields.
 fn prompt_history(messages: &[Message]) -> Vec<Message> {
@@ -62,10 +103,19 @@ fn prompt_history(messages: &[Message]) -> Vec<Message> {
                 .as_ref()
                 .and_then(|id| titles.get(id))
                 .cloned()
-                .unwrap_or_else(|| "mistl (unknown call)".into());
+                .unwrap_or_else(|| "tool (unknown call)".into());
             let text = message.content.clone().unwrap_or_default();
-            // Native history stores only text; successful runner output starts here.
-            let ok = text.lines().next() == Some("exit code: 0");
+            // Native history stores only text. Commands carry an exit code;
+            // file and process tools report failures with an error prefix.
+            let first = text.lines().next().unwrap_or_default();
+            let ok = if first.starts_with("exit code:") {
+                first == "exit code: 0" && !text.contains("[note]")
+            } else {
+                !first.starts_with("error:")
+                    && !first.starts_with("refused:")
+                    && first != "cancelled"
+                    && first != "the user declined to run this command"
+            };
             results.push((title, ToolOutput { text, ok }));
             continue;
         }
@@ -76,28 +126,20 @@ fn prompt_history(messages: &[Message]) -> Vec<Message> {
         let mut content = message.content.clone().unwrap_or_default();
         if message.role == Role::Assistant {
             for call in &message.tool_calls {
-                let (title, command) =
-                    match mistl::parse_call(&call.function.name, &call.function.arguments) {
+                let (title, fence, command) =
+                    match tools::parse_call(&call.function.name, &call.function.arguments) {
                         Ok(inv) => {
-                            let title = mistl::title(&inv);
-                            let command = match inv {
-                                mistl::Invocation::Run(_) => title
-                                    .strip_prefix("mistl")
-                                    .unwrap()
-                                    .trim_start()
-                                    .to_string(),
-                                mistl::Invocation::Help(path) => {
-                                    mistl::title(&mistl::Invocation::Run(path))
-                                        .strip_prefix("mistl")
-                                        .unwrap()
-                                        .trim_start()
-                                        .to_string()
-                                }
-                            };
-                            (title, command)
+                            let title = tools::title(&inv);
+                            let (fence, command) = tools::prompt_render(&inv);
+                            (title, fence, command)
                         }
                         Err(e) => (
                             call.function.name.clone(),
+                            match call.function.name.as_str() {
+                                mistl::TOOL_MISTL => "mistl",
+                                mistl::TOOL_HELP => "mistl-help",
+                                _ => "tool",
+                            },
                             format!(
                                 "# invalid tool call: {e}\n# {} {}",
                                 call.function.name, call.function.arguments
@@ -105,11 +147,6 @@ fn prompt_history(messages: &[Message]) -> Vec<Message> {
                         ),
                     };
                 titles.insert(call.id.clone(), title);
-                let fence = if call.function.name == mistl::TOOL_HELP {
-                    "mistl-help"
-                } else {
-                    "mistl"
-                };
                 if !content.is_empty() {
                     content.push_str("\n\n");
                 }
@@ -130,14 +167,17 @@ fn prompt_history(messages: &[Message]) -> Vec<Message> {
 }
 
 /// Spawn the agent task on the current tokio runtime.
-pub fn spawn(cfg: Config) -> Result<AgentHandle> {
+pub fn spawn(cfg: Config, workspace: Workspace) -> Result<AgentHandle> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UserCommand>();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(Mutex::new(CancellationToken::new()));
 
     let mut agent = Agent {
         llm: LlmClient::new(&cfg)?,
-        runner: MistlRunner::new(&cfg),
+        workspace_prompt: workspace.prompt_section(),
+        toolbox: Toolbox::new(&cfg, workspace),
+        pending_shell: PendingShell::default(),
+        shell_sequence: 1,
         messages: Vec::new(),
         mode: cfg.tool_mode,
         catalog: String::new(),
@@ -145,6 +185,7 @@ pub fn spawn(cfg: Config) -> Result<AgentHandle> {
         endpoint_ready: false,
         mistl_ready: false,
         tx: ev_tx,
+        model_catalog: HashMap::new(),
         cfg,
     };
     let cancel_slot = cancel.clone();
@@ -158,9 +199,9 @@ pub fn spawn(cfg: Config) -> Result<AgentHandle> {
                     agent.turn(text, &token).await;
                     let _ = agent.tx.send(AgentEvent::TurnDone);
                 }
-                UserCommand::Clear => agent.messages.truncate(1),
+                UserCommand::Clear => agent.clear(),
                 UserCommand::SetModel(m) => {
-                    agent.cfg.model = m.clone();
+                    agent.cfg.set_model(m.clone());
                     agent.llm.set_model(m.clone());
                     agent.send(AgentEvent::Info(format!("model: {m}")));
                 }
@@ -173,14 +214,21 @@ pub fn spawn(cfg: Config) -> Result<AgentHandle> {
                         e.as_deref().unwrap_or("default")
                     )));
                 }
-                UserCommand::Configure(s) => agent.configure(s),
-                UserCommand::ListModels(probe) => agent.list_models(probe, &token).await,
+                UserCommand::Configure(s) => agent.configure(*s),
+                UserCommand::ListModels(probe) => {
+                    agent.list_models(probe.map(|s| *s), &token).await
+                }
                 UserCommand::Mistl(op) => {
                     agent.mistl_op(op, &token).await;
                     agent.send(AgentEvent::TurnDone);
                 }
+                UserCommand::Shell(command) => {
+                    agent.shell(command, &token).await;
+                    agent.send(AgentEvent::TurnDone);
+                }
             }
         }
+        agent.toolbox.processes.stop_all();
     });
 
     Ok(AgentHandle {
@@ -204,11 +252,47 @@ impl Agent {
     }
 
     fn system_prompt(&self) -> String {
-        if self.mistl_ready {
-            prompt::system_prompt(self.mode, &self.catalog)
-        } else {
-            prompt::system_prompt_plain()
+        prompt::system_prompt(
+            self.mode,
+            self.mistl_ready,
+            &self.catalog,
+            &self.workspace_prompt,
+        )
+    }
+
+    fn clear(&mut self) {
+        self.messages.truncate(1);
+        self.pending_shell.clear();
+    }
+
+    async fn shell(&mut self, command: String, token: &CancellationToken) {
+        if command.trim().is_empty() {
+            self.send(AgentEvent::Info("enter a command after !".into()));
+            return;
         }
+        // A fresh id keeps multiple direct commands distinct in the UI.
+        let id = format!("shell-{}", self.shell_sequence);
+        self.shell_sequence += 1;
+        self.send(AgentEvent::ToolStart {
+            id: id.clone(),
+            title: format!("! {command}"),
+        });
+        let tx = self.tx.clone();
+        let live_id = id.clone();
+        let mut on_output = move |chunk: &str| {
+            let _ = tx.send(AgentEvent::ToolOutput {
+                id: live_id.clone(),
+                chunk: chunk.into(),
+            });
+        };
+        let spec = process::shell_command(&command, &self.toolbox.workspace.root);
+        let output = process::run(&spec, None, token, &mut on_output).await;
+        self.pending_shell.push(&command, &output);
+        self.send(AgentEvent::ToolEnd {
+            id,
+            ok: output.ok,
+            output: output.text,
+        });
     }
 
     /// Run `fut`, turning cancellation into the `"cancelled"` error.
@@ -224,10 +308,10 @@ impl Agent {
 
     /// Start the mistl daemon if it is down (best effort; reports a notice).
     async fn start_daemon(&self, token: &CancellationToken) {
-        if !self.runner.is_available() {
+        if !self.toolbox.mistl.is_available() {
             return;
         }
-        match Self::cancellable(token, self.runner.ensure_daemon(token)).await {
+        match Self::cancellable(token, self.toolbox.mistl.ensure_daemon(token)).await {
             Ok(true) => self.send(AgentEvent::Info("started the mistl daemon".into())),
             Ok(false) => {}
             Err(e) if e.to_string() == "cancelled" => {}
@@ -237,14 +321,14 @@ impl Agent {
 
     /// Find the mistl local API: needs mistl, a running daemon, and `ai serve`.
     async fn discover_mistl_api(&self, token: &CancellationToken) -> Result<String> {
-        if !self.runner.is_available() {
+        if !self.toolbox.mistl.is_available() {
             anyhow::bail!(
                 "the mistl AI network needs mistl, which was not found. Run /mistl install, or \
                  open /settings and use an OpenAI-compatible API instead."
             );
         }
         self.start_daemon(token).await;
-        let listen = Self::cancellable(token, self.runner.serve_start(token)).await?;
+        let listen = Self::cancellable(token, self.toolbox.mistl.serve_start(token)).await?;
         Ok(format!("http://{listen}/v1"))
     }
 
@@ -286,8 +370,10 @@ impl Agent {
         self.llm = llm;
         self.cfg = cfg;
         self.messages.clear();
+        self.pending_shell.clear();
         self.endpoint_ready = false;
         self.mistl_ready = false;
+        self.model_catalog.clear();
         self.send(AgentEvent::SettingsApplied(LlmSettings::from_config(
             &self.cfg,
         )));
@@ -301,11 +387,45 @@ impl Agent {
             let settings = probe.unwrap_or_else(|| LlmSettings::from_config(&self.cfg));
             let mut cfg = self.cfg.clone();
             settings.apply(&mut cfg)?;
+            if cfg.backend == Backend::Custom
+                && !settings.selected_provider().is_some_and(|p| p.enabled)
+                && settings.default_ref.is_some()
+            {
+                anyhow::bail!("{}", config::text::get("unavailable"));
+            }
+            let id = if cfg.backend == Backend::Mistl {
+                "mistl".into()
+            } else {
+                format!(
+                    "http:{}",
+                    cfg.default_ref
+                        .as_ref()
+                        .map(|r| r.provider_id.as_str())
+                        .unwrap_or("")
+                )
+            };
+            if let Some(cached) = self.model_catalog.get(&id).filter(|c| {
+                c.base_url == cfg.base_url
+                    && c.api_key == cfg.api_key
+                    && c.fetched.elapsed() < Duration::from_secs(10)
+            }) {
+                return Ok(cached.models.clone());
+            }
             let mut client = LlmClient::new(&cfg)?;
             if cfg.backend == Backend::Mistl {
                 client.set_base_url(self.discover_mistl_api(token).await?);
             }
-            client.list_models(token).await
+            let models = client.list_models(token).await?;
+            self.model_catalog.insert(
+                id,
+                CachedModels {
+                    base_url: cfg.base_url,
+                    api_key: cfg.api_key,
+                    fetched: Instant::now(),
+                    models: models.clone(),
+                },
+            );
+            Ok(models)
         }
         .await;
         match result {
@@ -323,20 +443,20 @@ impl Agent {
     async fn mistl_op(&mut self, op: MistlOp, token: &CancellationToken) {
         match op {
             MistlOp::Info => {
-                let found = self.runner.is_available();
+                let found = self.toolbox.mistl.is_available();
                 self.send(AgentEvent::MistlAvailable(found));
                 self.send(AgentEvent::Info(if found {
-                    format!("mistl: {}", self.runner.bin())
+                    format!("mistl: {}", self.toolbox.mistl.bin())
                 } else {
                     NO_MISTL_HINT.to_string()
                 }));
             }
             MistlOp::Start => {
-                if !self.runner.is_available() {
+                if !self.toolbox.mistl.is_available() {
                     self.send(AgentEvent::Error(NO_MISTL_HINT.into()));
                     return;
                 }
-                match Self::cancellable(token, self.runner.ensure_daemon(token)).await {
+                match Self::cancellable(token, self.toolbox.mistl.ensure_daemon(token)).await {
                     Ok(true) => self.send(AgentEvent::Info("started the mistl daemon".into())),
                     Ok(false) => self.send(AgentEvent::Info(
                         "the mistl daemon is already running".into(),
@@ -392,9 +512,9 @@ impl Agent {
         let path = Self::cancellable(token, install::install_release(&release, &dest)).await?;
         let path = path.to_string_lossy().into_owned();
         self.cfg.mistl_bin = path.clone();
-        self.runner.set_bin(path.clone());
+        self.toolbox.mistl.set_bin(path.clone());
         if !self.mistl_ready {
-            // The running conversation was chat-only; the next one gets the tools.
+            // Rebuild the system prompt and catalog on the next message.
             self.messages.clear();
             self.endpoint_ready = false;
         }
@@ -426,7 +546,7 @@ impl Agent {
                 self.report(e);
                 return;
             }
-            self.mistl_ready = self.runner.is_available();
+            self.mistl_ready = self.toolbox.mistl.is_available();
             if self.mistl_ready {
                 if self.cfg.backend == Backend::Custom {
                     self.start_daemon(token).await;
@@ -436,23 +556,24 @@ impl Agent {
                         self.send(AgentEvent::Info("cancelled".into()));
                         return;
                     }
-                    c = self.runner.catalog() => c,
+                    c = self.toolbox.mistl.catalog() => c,
                 };
                 self.catalog = catalog;
             } else {
                 self.send(AgentEvent::Info(format!(
-                    "{NO_MISTL_HINT} Chatting without mistl tools."
+                    "{NO_MISTL_HINT} Using workspace tools only."
                 )));
             }
             let sys = self.system_prompt();
             self.messages.push(Message::system(sys));
         }
+        let text = self.pending_shell.prepend(text);
         self.messages.push(Message::user(text));
 
         for _ in 0..self.cfg.max_steps {
             let turn = loop {
-                let specs = if self.mistl_ready && self.mode == ToolMode::Native {
-                    mistl::tool_specs()
+                let specs = if self.mode == ToolMode::Native {
+                    tools::specs(self.mistl_ready, &self.toolbox.workspace)
                 } else {
                     Vec::new()
                 };
@@ -484,10 +605,7 @@ impl Agent {
             self.send(AgentEvent::AssistantDone);
 
             let native = self.mode == ToolMode::Native;
-            let calls: Vec<ToolCall> = if !self.mistl_ready {
-                self.messages.push(Message::assistant(turn.content.clone()));
-                Vec::new()
-            } else if native {
+            let calls: Vec<ToolCall> = if native {
                 self.messages.push(Message {
                     role: Role::Assistant,
                     content: (!turn.content.is_empty()).then(|| turn.content.clone()),
@@ -550,14 +668,20 @@ impl Agent {
         token: &CancellationToken,
     ) -> (String, ToolOutput) {
         let fail = |text: String| ToolOutput { text, ok: false };
-        let inv = match mistl::parse_call(&call.function.name, &call.function.arguments) {
+        let inv = match tools::parse_call(&call.function.name, &call.function.arguments) {
             Ok(i) => i,
             Err(e) => {
                 return (call.function.name.clone(), fail(format!("error: {e:#}")));
             }
         };
-        let title = mistl::title(&inv);
-        match mistl::classify(&inv) {
+        let title = tools::title(&inv);
+        if matches!(inv, tools::Invocation::Mistl(_)) && !self.mistl_ready {
+            return (
+                title,
+                fail("error: mistl is unavailable; use workspace tools or /mistl install".into()),
+            );
+        }
+        match tools::classify(&inv, &self.toolbox.workspace) {
             Safety::ReadOnly => {}
             Safety::Blocked(r) => return (title, fail(format!("refused: {r}"))),
             Safety::Mutating => {
@@ -565,7 +689,7 @@ impl Agent {
                     let (reply, rx) = oneshot::channel();
                     self.send(AgentEvent::ApprovalRequest {
                         title: title.clone(),
-                        reason: "changes state".into(),
+                        reason: tools::approval_reason(&inv).into(),
                         reply,
                     });
                     let answer = tokio::select! {
@@ -591,7 +715,15 @@ impl Agent {
             id: call.id.clone(),
             title: title.clone(),
         });
-        let out = self.runner.run(&inv, token).await;
+        let tx = self.tx.clone();
+        let id = call.id.clone();
+        let mut on_output = move |chunk: &str| {
+            let _ = tx.send(AgentEvent::ToolOutput {
+                id: id.clone(),
+                chunk: chunk.into(),
+            });
+        };
+        let out = self.toolbox.run(&inv, token, &mut on_output).await;
         self.send(AgentEvent::ToolEnd {
             id: call.id.clone(),
             ok: out.ok,
@@ -605,6 +737,14 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::types::FunctionCall;
+
+    fn workspace() -> Workspace {
+        Workspace {
+            root: ".".into(),
+            justfile: None,
+            just_bin: "just".into(),
+        }
+    }
 
     fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -751,7 +891,7 @@ mod tests {
                 .content
                 .as_ref()
                 .unwrap()
-                .contains("$ mistl (unknown call)")
+                .contains("$ tool (unknown call)")
         );
         assert!(prompt_history(&[]).is_empty());
         for message in converted {
@@ -768,7 +908,11 @@ mod tests {
         let (tx, mut events) = mpsc::unbounded_channel();
         let mut agent = Agent {
             llm: LlmClient::new(&cfg).unwrap(),
-            runner: MistlRunner::new(&cfg),
+            workspace_prompt: "WORKSPACE".into(),
+            toolbox: Toolbox::new(&cfg, workspace()),
+            pending_shell: PendingShell::default(),
+            shell_sequence: 1,
+            model_catalog: HashMap::new(),
             mode: cfg.tool_mode,
             catalog: "CATALOG".into(),
             messages: vec![Message::system("native"), Message::user("question")],
@@ -787,7 +931,12 @@ mod tests {
         assert_eq!(agent.mode, ToolMode::Prompt);
         assert_eq!(
             agent.messages[0],
-            Message::system(prompt::system_prompt(ToolMode::Prompt, "CATALOG"))
+            Message::system(prompt::system_prompt(
+                ToolMode::Prompt,
+                true,
+                "CATALOG",
+                "WORKSPACE"
+            ))
         );
         assert_eq!(agent.messages[1], Message::user("question"));
         assert!(matches!(events.try_recv().unwrap(), AgentEvent::Info(s)
@@ -802,6 +951,222 @@ mod tests {
         assert!(events.try_recv().is_err());
     }
 
+    #[test]
+    fn converts_workspace_history_and_keeps_options() {
+        let calls = vec![
+            call("just", "just", r#"{"recipe":"build","args":["--release"]}"#),
+            call("bg", "just", r#"{"recipe":"serve","background":true}"#),
+            call("ls", "list_dir", r#"{"path":"target"}"#),
+            call(
+                "find",
+                "find_files",
+                r#"{"glob":"**/*.exe","include_ignored":true}"#,
+            ),
+            call(
+                "grep",
+                "grep",
+                r#"{"pattern":"foo","case_insensitive":true}"#,
+            ),
+            call(
+                "read",
+                "read_file",
+                r#"{"path":"src/main.rs","offset":20,"limit":10}"#,
+            ),
+            call("sh", "shell", r#"{"command":"echo hi","background":true}"#),
+            call("ps", "process_list", "{}"),
+            call("out", "process_output", r#"{"id":2,"tail_bytes":100}"#),
+            call("stop", "process_stop", r#"{"id":2}"#),
+        ];
+        let mut input = vec![Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: calls.clone(),
+            tool_call_id: None,
+        }];
+        input.push(Message::tool_result("just", "exit code: 0"));
+        input.push(Message::tool_result("bg", "started process 1: just serve"));
+        input.push(Message::tool_result("ls", "error: directory missing"));
+        let converted = prompt_history(&input);
+        let rebuilt = prompt::parse_prompt_calls(converted[0].content.as_deref().unwrap());
+        assert_eq!(rebuilt.len(), calls.len());
+        for (original, rebuilt) in calls.iter().zip(rebuilt) {
+            assert_eq!(
+                tools::parse_call(&original.function.name, &original.function.arguments).unwrap(),
+                tools::parse_call(&rebuilt.function.name, &rebuilt.function.arguments).unwrap()
+            );
+        }
+        let results = converted[1].content.as_deref().unwrap();
+        assert!(results.starts_with("[tool results]\n$ just build --release"));
+        assert!(results.contains("$ just serve &\nstarted process 1: just serve\nstatus: ok"));
+        assert!(results.contains("$ list_dir target\nerror: directory missing\nstatus: failed"));
+        assert_eq!(prompt_history(&converted), converted);
+    }
+
+    #[test]
+    fn pending_shell_context_is_ordered_and_consumed_once() {
+        let mut pending = PendingShell::default();
+        assert_eq!(pending.prepend("question".into()), "question");
+        pending.push(
+            "echo one",
+            &ToolOutput {
+                ok: true,
+                text: "exit code: 0\n--- stdout ---\none".into(),
+            },
+        );
+        pending.push(
+            "bad-command",
+            &ToolOutput {
+                ok: false,
+                text: "exit code: 1".into(),
+            },
+        );
+        assert_eq!(
+            pending.prepend("explain".into()),
+            "[The user ran a shell command in the workspace]\n$ echo one\nexit code: 0\n--- stdout ---\none\n\n[The user ran a shell command in the workspace]\n$ bad-command\nexit code: 1\n\nexplain"
+        );
+        assert_eq!(pending.prepend("next".into()), "next");
+        pending.push(
+            "echo hi",
+            &ToolOutput {
+                ok: true,
+                text: "hi".into(),
+            },
+        );
+        pending.clear();
+        assert_eq!(pending.prepend("clean".into()), "clean");
+    }
+
+    #[test]
+    fn clear_and_configure_drop_pending_shell_context() {
+        let cfg = Config {
+            config_path: None,
+            ..Config::default()
+        };
+        let (tx, _events) = mpsc::unbounded_channel();
+        let mut agent = Agent {
+            llm: LlmClient::new(&cfg).unwrap(),
+            toolbox: Toolbox::new(&cfg, workspace()),
+            workspace_prompt: "WORKSPACE".into(),
+            pending_shell: PendingShell::default(),
+            shell_sequence: 1,
+            model_catalog: HashMap::new(),
+            messages: vec![Message::system("system"), Message::user("old")],
+            mode: cfg.tool_mode,
+            catalog: String::new(),
+            auto_approve: false,
+            endpoint_ready: true,
+            mistl_ready: false,
+            tx,
+            cfg,
+        };
+        let output = ToolOutput {
+            ok: true,
+            text: "hi".into(),
+        };
+        agent.pending_shell.push("echo hi", &output);
+        agent.clear();
+        assert_eq!(agent.messages, vec![Message::system("system")]);
+        assert_eq!(agent.pending_shell.prepend("clean".into()), "clean");
+        agent.pending_shell.push("echo hi", &output);
+        agent.configure(LlmSettings::from_config(&agent.cfg));
+        assert!(agent.messages.is_empty());
+        assert_eq!(agent.pending_shell.prepend("clean".into()), "clean");
+        let system = agent.system_prompt();
+        assert!(system.contains("workspace tools still work") && system.contains("WORKSPACE"));
+    }
+
+    #[tokio::test]
+    async fn workspace_commands_request_their_specific_approval() {
+        let cfg = Config::default();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let mut ws = workspace();
+        ws.justfile = Some(crate::workspace::Justfile {
+            path: "justfile".into(),
+            dir: ".".into(),
+            default_recipe: None,
+            source: String::new(),
+            error: None,
+            recipes: vec![crate::workspace::Recipe {
+                name: "build".into(),
+                doc: None,
+                params: vec![],
+                private: false,
+            }],
+        });
+        let mut agent = Agent {
+            llm: LlmClient::new(&cfg).unwrap(),
+            toolbox: Toolbox::new(&cfg, ws),
+            workspace_prompt: "WORKSPACE".into(),
+            pending_shell: PendingShell::default(),
+            shell_sequence: 1,
+            model_catalog: HashMap::new(),
+            messages: Vec::new(),
+            mode: cfg.tool_mode,
+            catalog: String::new(),
+            auto_approve: false,
+            endpoint_ready: true,
+            mistl_ready: false,
+            tx,
+            cfg,
+        };
+        let token = CancellationToken::new();
+        for (name, args, expected_title, expected_reason) in [
+            (
+                "just",
+                r#"{"recipe":"build"}"#,
+                "just build",
+                "runs a justfile recipe",
+            ),
+            (
+                "shell",
+                r#"{"command":"echo hi"}"#,
+                "$ echo hi",
+                "runs a shell command",
+            ),
+            (
+                "process_stop",
+                r#"{"id":2}"#,
+                "process_stop 2",
+                "stops a background process",
+            ),
+        ] {
+            let call = call("test", name, args);
+            let run = agent.run_call(&call, &token);
+            let refuse = async {
+                match events.recv().await.unwrap() {
+                    AgentEvent::ApprovalRequest {
+                        title,
+                        reason,
+                        reply,
+                    } => {
+                        assert_eq!(title, expected_title);
+                        assert_eq!(reason, expected_reason);
+                        reply.send(Approval::No).unwrap();
+                    }
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            };
+            let ((title, output), ()) = tokio::join!(run, refuse);
+            assert_eq!(title, expected_title);
+            assert!(!output.ok && output.text.contains("declined"));
+            assert!(events.try_recv().is_err());
+        }
+        // Both failures return before dispatch, without touching the stubs.
+        for (name, args, error) in [
+            (
+                "just",
+                r#"{"recipe":"missing"}"#,
+                "available recipes: build",
+            ),
+            ("mistl", r#"{"args":["status"]}"#, "mistl is unavailable"),
+            ("shell", "{bad", "invalid tool arguments JSON"),
+        ] {
+            let (_, output) = agent.run_call(&call("bad", name, args), &token).await;
+            assert!(!output.ok && output.text.contains(error));
+            assert!(events.try_recv().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn startup_failure_leaves_history_empty_for_retry() {
         // A directory cannot be executed, so this never invokes mistl.
@@ -812,7 +1177,11 @@ mod tests {
         let (tx, mut events) = mpsc::unbounded_channel();
         let mut agent = Agent {
             llm: LlmClient::new(&cfg).unwrap(),
-            runner: MistlRunner::new(&cfg),
+            workspace_prompt: "WORKSPACE".into(),
+            toolbox: Toolbox::new(&cfg, workspace()),
+            pending_shell: PendingShell::default(),
+            shell_sequence: 1,
+            model_catalog: HashMap::new(),
             messages: Vec::new(),
             mode: cfg.tool_mode,
             catalog: String::new(),
